@@ -1,0 +1,35 @@
+# ============================================================
+# requirements.txt
+# ============================================================
+
+streamlit
+openai
+python-dotenv
+requests
+faiss-cpu
+numpy
+sentence-transformers
+tiktoken
+pandas
+PyMuPDF
+pdfplumber
+openpyxl
+langchain-text-splitters
+streamlit
+openai
+python-dotenv
+
+langchain-text-splitters
+tiktoken
+
+pandas
+numpy
+
+sentence-transformers
+faiss-cpu
+
+pymupdf
+pdfplumber
+openpyxl
+
+ddgs
