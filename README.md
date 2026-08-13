@@ -81,3 +81,22 @@ Enterprise-Chunking-Studio/
 ├── data/                   # Local uploaded documents
 │
 └── vector_store/           # Local FAISS vector database
+
+
+##Requirements
+Python 3.11+
+OpenRouter API key
+Internet connection
+Required Python packages from requirements.txt
+
+##Create a virtual environment:
+
+python -m venv venv
+
+Activate the virtual environment on Windows:
+
+venv\Scripts\activate
+
+##Install dependencies:
+
+pip install -r requirements.txt
