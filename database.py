@@ -1,7 +1,16 @@
+import os
+
 import streamlit as st
 import psycopg2
+
 from psycopg2.extras import RealDictCursor
-from werkzeug.security import generate_password_hash, check_password_hash
+
+from werkzeug.security import (
+    generate_password_hash,
+    check_password_hash,
+)
+
+from supabase import create_client
 
 
 class Database:
@@ -12,6 +21,10 @@ class Database:
 
     def __init__(self):
 
+        # --------------------------------------------------------
+        # PostgreSQL
+        # --------------------------------------------------------
+
         self.database_url = st.secrets.get(
             "DATABASE_URL"
         )
@@ -20,6 +33,43 @@ class Database:
             raise RuntimeError(
                 "DATABASE_URL is not configured."
             )
+
+        # --------------------------------------------------------
+        # SUPABASE
+        # --------------------------------------------------------
+
+        self.supabase_url = st.secrets.get(
+            "SUPABASE_URL"
+        )
+
+        self.supabase_service_key = st.secrets.get(
+            "SUPABASE_SERVICE_ROLE_KEY"
+        )
+
+        if not self.supabase_url:
+            raise RuntimeError(
+                "SUPABASE_URL is not configured."
+            )
+
+        if not self.supabase_service_key:
+            raise RuntimeError(
+                "SUPABASE_SERVICE_ROLE_KEY is not configured."
+            )
+
+        # --------------------------------------------------------
+        # STORAGE BUCKET
+        # --------------------------------------------------------
+
+        self.storage_bucket = "enterprise-documents"
+
+        # --------------------------------------------------------
+        # SUPABASE CLIENT
+        # --------------------------------------------------------
+
+        self.supabase = create_client(
+            self.supabase_url,
+            self.supabase_service_key,
+        )
 
     # ============================================================
     # CONNECTION
@@ -32,7 +82,7 @@ class Database:
         )
 
     # ============================================================
-    # TEST CONNECTION
+    # TEST DATABASE CONNECTION
     # ============================================================
 
     def test_connection(self):
@@ -313,7 +363,72 @@ class Database:
             connection.close()
 
     # ============================================================
-    # CREATE DOCUMENT
+    # UPLOAD FILE TO SUPABASE STORAGE
+    # ============================================================
+
+    def upload_document_file(
+        self,
+        file_bytes,
+        storage_path,
+        content_type="application/octet-stream",
+    ):
+
+        try:
+
+            result = (
+                self.supabase
+                .storage
+                .from_(
+                    self.storage_bucket
+                )
+                .upload(
+                    storage_path,
+                    file_bytes,
+                    {
+                        "content-type": content_type,
+                        "upsert": "false",
+                    },
+                )
+            )
+
+            return result
+
+        except Exception:
+
+            raise
+
+    # ============================================================
+    # DELETE FILE FROM SUPABASE STORAGE
+    # ============================================================
+
+    def delete_document_file(
+        self,
+        storage_path,
+    ):
+
+        if not storage_path:
+
+            return
+
+        try:
+
+            (
+                self.supabase
+                .storage
+                .from_(
+                    self.storage_bucket
+                )
+                .remove(
+                    [storage_path]
+                )
+            )
+
+        except Exception:
+
+            raise
+
+    # ============================================================
+    # CREATE DOCUMENT RECORD
     # ============================================================
 
     def create_document(
@@ -520,6 +635,52 @@ class Database:
 
         try:
 
+            # ----------------------------------------------------
+            # FIRST: Get document information
+            # ----------------------------------------------------
+
+            with connection.cursor(
+                cursor_factory=RealDictCursor
+            ) as cursor:
+
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        file_path
+                    FROM documents
+                    WHERE id = %s
+                    LIMIT 1;
+                    """,
+                    (
+                        document_id,
+                    ),
+                )
+
+                document = cursor.fetchone()
+
+            if not document:
+
+                return False
+
+            # ----------------------------------------------------
+            # SECOND: Delete actual file from Storage
+            # ----------------------------------------------------
+
+            storage_path = document.get(
+                "file_path"
+            )
+
+            if storage_path:
+
+                self.delete_document_file(
+                    storage_path
+                )
+
+            # ----------------------------------------------------
+            # THIRD: Delete database record
+            # ----------------------------------------------------
+
             with connection.cursor() as cursor:
 
                 cursor.execute(
@@ -532,7 +693,9 @@ class Database:
                     ),
                 )
 
-                connection.commit()
+            connection.commit()
+
+            return True
 
         except Exception:
 
