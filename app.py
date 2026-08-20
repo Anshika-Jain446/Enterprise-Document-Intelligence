@@ -1,15 +1,35 @@
+# app.py
+
+import io
 import json
 import os
-import tempfile
+import hashlib
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
+from werkzeug.security import generate_password_hash, check_password_hash
+
+from chunking import ChunkingEngine
 from model import GeminiModel
 
 
 # ============================================================
-# PAGE CONFIGURATION
+# OPTIONAL POSTGRESQL DRIVER
+# ============================================================
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor, Json
+except ImportError:
+    psycopg2 = None
+    RealDictCursor = None
+    Json = None
+
+
+# ============================================================
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -21,1760 +41,805 @@ st.set_page_config(
 
 
 # ============================================================
-# ENTERPRISE RAG AGENT
+# CONFIG
 # ============================================================
 
-class EnterpriseRAGAgent:
-    """
-    Enterprise Agentic RAG controller.
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    os.getenv(
+        "POSTGRESQL_URL",
+        ""
+    )
+)
 
-    Compatible with the current model.py GeminiModel.
+# Optional individual PostgreSQL settings
+PG_HOST = os.getenv("PG_HOST", "localhost")
+PG_PORT = os.getenv("PG_PORT", "5432")
+PG_DATABASE = os.getenv("PG_DATABASE", "enterprise_rag")
+PG_USER = os.getenv("PG_USER", "postgres")
+PG_PASSWORD = os.getenv("PG_PASSWORD", "postgres")
 
-    Retrieval tools:
-        1. vector_search
-        2. document_search
-        3. table_search
-        4. web_search
 
-    The agent:
-        - plans retrieval
-        - executes retrieval
-        - evaluates evidence
-        - replans when evidence is insufficient
-        - generates a grounded final answer
-    """
+# ============================================================
+# POSTGRESQL DATABASE
+# ============================================================
 
-    def __init__(
-        self,
-        vector_db,
-        llm,
-        documents=None,
-        selected_sources=None,
-        conversation_history=None,
-        top_k=5,
-        max_iterations=4,
-    ):
-        self.vector_db = vector_db
-        self.llm = llm
+class PostgreSQLStore:
 
-        self.documents = documents or []
+    def __init__(self):
+        self.connection = None
 
-        self.selected_sources = self._normalize_sources(
-            selected_sources
-        )
+    # --------------------------------------------------------
+    # CONNECTION
+    # --------------------------------------------------------
 
-        self.conversation_history = (
-            conversation_history or []
-        )
+    def connect(self):
 
-        self.top_k = max(
-            1,
-            int(top_k),
-        )
-
-        self.max_iterations = max(
-            1,
-            int(max_iterations),
-        )
-
-        self.allowed_actions = {
-            "vector_search",
-            "document_search",
-            "table_search",
-            "web_search",
-        }
-
-    # ========================================================
-    # SOURCE NORMALIZATION
-    # ========================================================
-
-    @staticmethod
-    def _normalize_sources(sources):
-        if not sources:
-            return []
-
-        if isinstance(sources, str):
-            sources = [sources]
-
-        normalized = set()
-
-        for source in sources:
-            if source is None:
-                continue
-
-            value = str(source).strip()
-
-            if not value:
-                continue
-
-            for part in value.split(","):
-                part = part.strip()
-
-                if part:
-                    normalized.add(part)
-
-        return sorted(normalized)
-
-    # ========================================================
-    # BASENAME
-    # ========================================================
-
-    @staticmethod
-    def _basename(value):
-        if not value:
-            return ""
-
-        value = str(value).replace("\\", "/")
-
-        return value.rstrip("/").split("/")[-1]
-
-    # ========================================================
-    # SOURCE MATCHING
-    # ========================================================
-
-    def _source_matches_selection(self, result):
-
-        if not self.selected_sources:
-            return True
-
-        if not isinstance(result, dict):
-            return False
-
-        possible_sources = []
-
-        for key in (
-            "source",
-            "filename",
-            "file_name",
-            "document",
-            "document_name",
-        ):
-            value = result.get(key)
-
-            if value:
-                possible_sources.append(
-                    str(value)
-                )
-
-        metadata = result.get(
-            "metadata",
-            {},
-        )
-
-        if isinstance(metadata, dict):
-
-            for key in (
-                "uploaded_file_name",
-                "file_name",
-                "filename",
-                "source",
-                "document",
-                "document_name",
-            ):
-                value = metadata.get(key)
-
-                if value:
-                    possible_sources.append(
-                        str(value)
-                    )
-
-        if not possible_sources:
-            return False
-
-        result_sources = set(
-            self._normalize_sources(
-                possible_sources
+        if psycopg2 is None:
+            raise RuntimeError(
+                "psycopg2 is not installed. "
+                "Install it with: pip install psycopg2-binary"
             )
+
+        if self.connection is not None:
+            try:
+                if self.connection.closed == 0:
+                    return self.connection
+            except Exception:
+                pass
+
+        if DATABASE_URL:
+
+            self.connection = psycopg2.connect(
+                DATABASE_URL
+            )
+
+        else:
+
+            self.connection = psycopg2.connect(
+                host=PG_HOST,
+                port=PG_PORT,
+                database=PG_DATABASE,
+                user=PG_USER,
+                password=PG_PASSWORD,
+            )
+
+        self.connection.autocommit = False
+
+        return self.connection
+
+    # --------------------------------------------------------
+    # INITIALIZE DATABASE
+    # --------------------------------------------------------
+
+    def initialize(self):
+
+        conn = self.connect()
+
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(255) UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
         )
 
-        selected_sources = set(
-            self.selected_sources
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL
+                    REFERENCES users(id)
+                    ON DELETE CASCADE,
+
+                filename TEXT NOT NULL,
+                file_type TEXT,
+                file_size BIGINT,
+
+                file_data BYTEA,
+
+                chunking_method TEXT,
+                chunk_size INTEGER,
+                chunk_overlap INTEGER,
+
+                metadata JSONB DEFAULT '{}'::jsonb,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                UNIQUE(user_id, filename)
+            );
+            """
         )
 
-        if selected_sources & result_sources:
-            return True
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id SERIAL PRIMARY KEY,
 
-        selected_basenames = {
-            self._basename(source)
-            for source in selected_sources
-        }
+                document_id INTEGER NOT NULL
+                    REFERENCES documents(id)
+                    ON DELETE CASCADE,
 
-        result_basenames = {
-            self._basename(source)
-            for source in result_sources
-        }
+                chunk_id INTEGER NOT NULL,
+                chunk_type TEXT,
 
-        return bool(
-            selected_basenames
-            & result_basenames
+                content TEXT,
+
+                page INTEGER,
+                tokens INTEGER,
+                characters INTEGER,
+
+                metadata JSONB DEFAULT '{}'::jsonb,
+
+                chunk_data JSONB DEFAULT '{}'::jsonb,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                UNIQUE(document_id, chunk_id)
+            );
+            """
         )
 
-    # ========================================================
-    # VECTOR SEARCH
-    # ========================================================
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_document
+            ON document_chunks(document_id);
+            """
+        )
 
-    def _vector_search(self, query):
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_document_chunks_content
+            ON document_chunks
+            USING gin(to_tsvector('english', content));
+            """
+        )
 
-        if not query or not query.strip():
-            return []
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS conversations (
+                id SERIAL PRIMARY KEY,
 
-        if self.vector_db is None:
-            return []
+                user_id INTEGER NOT NULL
+                    REFERENCES users(id)
+                    ON DELETE CASCADE,
+
+                title TEXT,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+
+                conversation_id INTEGER NOT NULL
+                    REFERENCES conversations(id)
+                    ON DELETE CASCADE,
+
+                role TEXT NOT NULL,
+
+                content TEXT NOT NULL,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+
+        conn.commit()
+
+    # --------------------------------------------------------
+    # USER
+    # --------------------------------------------------------
+
+    def create_user(
+        self,
+        username,
+        password,
+    ):
+
+        conn = self.connect()
+
+        cursor = conn.cursor()
+
+        password_hash = generate_password_hash(
+            password
+        )
 
         try:
 
-            index = getattr(
-                self.vector_db,
-                "index",
-                None,
+            cursor.execute(
+                """
+                INSERT INTO users (
+                    username,
+                    password_hash
+                )
+                VALUES (%s, %s)
+                RETURNING id, username
+                """,
+                (
+                    username,
+                    password_hash,
+                ),
             )
 
-            if index is None:
+            result = cursor.fetchone()
 
-                try:
-                    exists = bool(
-                        self.vector_db.exists()
-                    )
-                except Exception:
-                    exists = False
+            conn.commit()
 
-                if not exists:
-                    return []
+            return result
 
-                try:
-                    self.vector_db.load()
-                except Exception as exc:
-                    print(
-                        f"Vector database load failed: {exc}"
-                    )
-                    return []
+        except Exception:
 
-            if getattr(
-                self.vector_db,
-                "index",
-                None,
-            ) is None:
-                return []
+            conn.rollback()
 
-            try:
+            return None
 
-                results = self.vector_db.search(
-                    query,
-                    top_k=self.top_k,
-                    sources=(
-                        self.selected_sources
-                        or None
-                    ),
-                )
+    # --------------------------------------------------------
+    # LOGIN
+    # --------------------------------------------------------
 
-            except TypeError:
+    def authenticate(
+        self,
+        username,
+        password,
+    ):
 
-                results = self.vector_db.search(
-                    query,
-                    top_k=self.top_k,
-                )
+        conn = self.connect()
 
-            normalized = []
+        cursor = conn.cursor(
+            cursor_factory=RealDictCursor
+        )
 
-            for result in results or []:
+        cursor.execute(
+            """
+            SELECT
+                id,
+                username,
+                password_hash
+            FROM users
+            WHERE username = %s
+            """,
+            (username,),
+        )
 
-                if not isinstance(
-                    result,
-                    dict,
-                ):
-                    continue
+        user = cursor.fetchone()
 
-                if not self._source_matches_selection(
-                    result
-                ):
-                    continue
+        if not user:
+            return None
 
-                item = dict(result)
+        if not check_password_hash(
+            user["password_hash"],
+            password,
+        ):
+            return None
 
-                item["source_type"] = "document"
-                item["search_type"] = "vector_search"
+        return dict(user)
 
-                if not item.get("content"):
-                    item["content"] = (
-                        item.get("text")
-                        or item.get("page_content")
-                        or ""
-                    )
+    # --------------------------------------------------------
+    # DOCUMENT
+    # --------------------------------------------------------
 
-                normalized.append(item)
+    def save_document(
+        self,
+        user_id,
+        filename,
+        file_type,
+        file_bytes,
+        chunking_method,
+        chunk_size,
+        chunk_overlap,
+        metadata,
+    ):
 
-            return normalized[:self.top_k]
+        conn = self.connect()
 
-        except Exception as exc:
+        cursor = conn.cursor()
 
-            print(
-                f"Vector search failed: {exc}"
+        cursor.execute(
+            """
+            DELETE FROM documents
+            WHERE user_id = %s
+            AND filename = %s
+            """,
+            (
+                user_id,
+                filename,
+            ),
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO documents (
+                user_id,
+                filename,
+                file_type,
+                file_size,
+                file_data,
+                chunking_method,
+                chunk_size,
+                chunk_overlap,
+                metadata
             )
-
-            return []
-
-    # ========================================================
-    # DOCUMENT SEARCH
-    # ========================================================
-
-    def _document_search(self, query):
-
-        if not query or not self.documents:
-            return []
-
-        words = {
-            word.lower().strip(
-                ".,!?;:()[]{}\"'"
+            VALUES (
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s
             )
-            for word in query.split()
-            if len(
-                word.strip(
-                    ".,!?;:()[]{}\"'"
-                )
-            ) > 2
-        }
+            RETURNING id
+            """,
+            (
+                user_id,
+                filename,
+                file_type,
+                len(file_bytes),
+                psycopg2.Binary(file_bytes),
+                chunking_method,
+                chunk_size,
+                chunk_overlap,
+                Json(metadata),
+            ),
+        )
 
-        if not words:
-            return []
+        document_id = cursor.fetchone()[0]
 
-        results = []
+        conn.commit()
 
-        for document in self.documents:
+        return document_id
 
-            if not isinstance(
-                document,
-                dict,
-            ):
-                continue
+    # --------------------------------------------------------
+    # SAVE CHUNKS
+    # --------------------------------------------------------
 
-            if not self._source_matches_selection(
-                document
-            ):
-                continue
+    def save_chunks(
+        self,
+        document_id,
+        chunks,
+    ):
 
-            metadata = document.get(
+        conn = self.connect()
+
+        cursor = conn.cursor()
+
+        for chunk in chunks:
+
+            metadata = chunk.get(
                 "metadata",
                 {},
             )
 
-            if not isinstance(
-                metadata,
-                dict,
-            ):
-                metadata = {}
+            cursor.execute(
+                """
+                INSERT INTO document_chunks (
+                    document_id,
+                    chunk_id,
+                    chunk_type,
+                    content,
+                    page,
+                    tokens,
+                    characters,
+                    metadata,
+                    chunk_data
+                )
+                VALUES (
+                    %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s
+                )
+                ON CONFLICT (
+                    document_id,
+                    chunk_id
+                )
+                DO UPDATE SET
+                    chunk_type = EXCLUDED.chunk_type,
+                    content = EXCLUDED.content,
+                    page = EXCLUDED.page,
+                    tokens = EXCLUDED.tokens,
+                    characters = EXCLUDED.characters,
+                    metadata = EXCLUDED.metadata,
+                    chunk_data = EXCLUDED.chunk_data
+                """,
+                (
+                    document_id,
 
-            text = str(
-                document.get(
-                    "text",
-                    document.get(
+                    chunk.get(
+                        "chunk_id"
+                    ),
+
+                    chunk.get(
+                        "chunk_type"
+                    ),
+
+                    chunk.get(
                         "content",
                         "",
                     ),
-                )
-            )
 
-            metadata_text = json.dumps(
-                metadata,
-                ensure_ascii=False,
-                default=str,
-            )
-
-            source_text = str(
-                document.get(
-                    "source",
-                    "",
-                )
-            )
-
-            filename_text = str(
-                document.get(
-                    "filename",
-                    document.get(
-                        "file_name",
-                        "",
+                    chunk.get(
+                        "page"
                     ),
-                )
+
+                    chunk.get(
+                        "tokens"
+                    ),
+
+                    chunk.get(
+                        "characters",
+                        len(
+                            str(
+                                chunk.get(
+                                    "content",
+                                    "",
+                                )
+                            )
+                        ),
+                    ),
+
+                    Json(metadata),
+
+                    Json(chunk),
+                ),
             )
 
-            searchable = (
-                text
-                + " "
-                + metadata_text
-                + " "
-                + source_text
-                + " "
-                + filename_text
-            ).lower()
+        conn.commit()
 
-            matched_words = [
-                word
-                for word in words
-                if word in searchable
-            ]
+    # --------------------------------------------------------
+    # DOCUMENT LIST
+    # --------------------------------------------------------
 
-            score = len(
-                matched_words
-            )
+    def get_documents(
+        self,
+        user_id,
+    ):
 
-            if score <= 0:
-                continue
+        conn = self.connect()
 
-            result = dict(document)
+        cursor = conn.cursor(
+            cursor_factory=RealDictCursor
+        )
 
-            result["similarity_score"] = (
-                score
-                / max(
-                    len(words),
-                    1,
-                )
-            )
-
-            result["source_type"] = "document"
-            result["search_type"] = "document_search"
-
-            result["content"] = (
-                result.get("content")
-                or result.get("text")
-                or metadata_text
-            )
-
-            results.append(
-                (
-                    score,
-                    result,
-                )
-            )
-
-        results.sort(
-            key=lambda item: item[0],
-            reverse=True,
+        cursor.execute(
+            """
+            SELECT
+                id,
+                filename,
+                file_type,
+                file_size,
+                chunking_method,
+                chunk_size,
+                chunk_overlap,
+                created_at
+            FROM documents
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            """,
+            (user_id,),
         )
 
         return [
-            result
-            for _, result
-            in results[:self.top_k]
+            dict(row)
+            for row in cursor.fetchall()
         ]
 
-    # ========================================================
-    # TABLE SEARCH
-    # ========================================================
+    # --------------------------------------------------------
+    # SEARCH CHUNKS
+    # --------------------------------------------------------
 
-    def _table_search(self, query):
+    def search_chunks(
+        self,
+        user_id,
+        query,
+        selected_document_ids=None,
+        chunk_types=None,
+        top_k=5,
+    ):
 
-        if not query or not self.documents:
-            return []
+        conn = self.connect()
 
-        words = {
-            word.lower().strip(
-                ".,!?;:()[]{}\"'"
+        cursor = conn.cursor(
+            cursor_factory=RealDictCursor
+        )
+
+        conditions = [
+            "d.user_id = %s"
+        ]
+
+        params = [
+            user_id
+        ]
+
+        # ----------------------------------------------------
+        # SOURCE FILTER
+        # ----------------------------------------------------
+
+        if selected_document_ids:
+
+            conditions.append(
+                "d.id = ANY(%s)"
             )
-            for word in query.split()
-            if len(
-                word.strip(
-                    ".,!?;:()[]{}\"'"
-                )
-            ) > 2
-        }
 
-        if not words:
-            return []
+            params.append(
+                selected_document_ids
+            )
+
+        # ----------------------------------------------------
+        # CHUNK TYPE FILTER
+        # ----------------------------------------------------
+
+        if chunk_types:
+
+            conditions.append(
+                "c.chunk_type = ANY(%s)"
+            )
+
+            params.append(
+                chunk_types
+            )
+
+        # ----------------------------------------------------
+        # FULL TEXT SEARCH
+        # ----------------------------------------------------
+
+        search_query = """
+            SELECT
+                c.id,
+                c.document_id,
+                c.chunk_id,
+                c.chunk_type,
+                c.content,
+                c.page,
+                c.tokens,
+                c.characters,
+                c.metadata,
+                c.chunk_data,
+                d.filename,
+                d.chunking_method,
+
+                ts_rank(
+                    to_tsvector(
+                        'english',
+                        COALESCE(c.content, '')
+                    ),
+                    plainto_tsquery(
+                        'english',
+                        %s
+                    )
+                ) AS similarity_score
+
+            FROM document_chunks c
+
+            JOIN documents d
+                ON d.id = c.document_id
+
+            WHERE
+                {conditions}
+
+            AND (
+                to_tsvector(
+                    'english',
+                    COALESCE(c.content, '')
+                )
+                @@ plainto_tsquery(
+                    'english',
+                    %s
+                )
+
+                OR
+                LOWER(c.content)
+                LIKE LOWER(%s)
+            )
+
+            ORDER BY similarity_score DESC
+
+            LIMIT %s
+        """.format(
+            conditions=" AND ".join(
+                conditions
+            )
+        )
+
+        params.extend(
+            [
+                query,
+                f"%{query}%",
+                top_k,
+            ]
+        )
+
+        cursor.execute(
+            search_query,
+            params,
+        )
+
+        rows = cursor.fetchall()
 
         results = []
 
-        for document in self.documents:
+        for row in rows:
 
-            if not isinstance(
-                document,
-                dict,
-            ):
-                continue
+            result = dict(row)
 
-            if not self._source_matches_selection(
-                document
-            ):
-                continue
-
-            tables = document.get(
-                "tables",
-                [],
-            )
-
-            if not isinstance(
-                tables,
-                list,
-            ):
-                continue
-
-            metadata = document.get(
-                "metadata",
-                {},
-            )
-
-            if not isinstance(
-                metadata,
-                dict,
-            ):
-                metadata = {}
-
-            document_source = (
-                document.get(
-                    "source"
-                )
-                or metadata.get(
-                    "uploaded_file_name"
-                )
-                or metadata.get(
+            result["source"] = (
+                result.get(
                     "filename"
                 )
             )
 
-            for table_index, table in enumerate(
-                tables
-            ):
-
-                if not isinstance(
-                    table,
-                    dict,
-                ):
-                    continue
-
-                table_data = (
-                    table.get("table")
-                    or table.get("data")
-                    or table.get("rows")
-                    or []
-                )
-
-                searchable = json.dumps(
-                    table_data,
-                    ensure_ascii=False,
-                    default=str,
-                ).lower()
-
-                matched_words = [
-                    word
-                    for word in words
-                    if word in searchable
-                ]
-
-                score = len(
-                    matched_words
-                )
-
-                if score <= 0:
-                    continue
-
-                result = dict(table)
-
-                if document_source:
-                    result.setdefault(
-                        "source",
-                        document_source,
-                    )
-
-                result.setdefault(
-                    "table_index",
-                    table_index,
-                )
-
-                result["similarity_score"] = (
-                    score
-                    / max(
-                        len(words),
-                        1,
-                    )
-                )
-
-                result["source_type"] = "table"
-                result["search_type"] = "table_search"
-
-                result["content"] = json.dumps(
-                    table_data,
-                    ensure_ascii=False,
-                    indent=2,
-                    default=str,
-                )
-
-                results.append(
-                    (
-                        score,
-                        result,
-                    )
-                )
-
-        results.sort(
-            key=lambda item: item[0],
-            reverse=True,
-        )
-
-        return [
-            result
-            for _, result
-            in results[:self.top_k]
-        ]
-
-    # ========================================================
-    # WEB SEARCH
-    # ========================================================
-
-    def _web_search(self, query):
-
-        if not query or not query.strip():
-            return []
-
-        web_method = getattr(
-            self.llm,
-            "web_search",
-            None,
-        )
-
-        if not callable(web_method):
-            return []
-
-        try:
-
-            results = web_method(
-                query=query,
-                max_results=self.top_k,
-            )
-
-            return self._normalize_results(
-                results,
-                "web_search",
-            )
-
-        except Exception as exc:
-
-            print(
-                f"Web search failed: {exc}"
-            )
-
-            return []
-
-    # ========================================================
-    # TOOL EXECUTION
-    # ========================================================
-
-    def execute_tool(
-        self,
-        action,
-        query,
-    ):
-
-        if action == "vector_search":
-            return self._vector_search(query)
-
-        if action == "document_search":
-            return self._document_search(query)
-
-        if action == "table_search":
-            return self._table_search(query)
-
-        if action == "web_search":
-            return self._web_search(query)
-
-        return []
-
-    # ========================================================
-    # NORMALIZE RESULTS
-    # ========================================================
-
-    def _normalize_results(
-        self,
-        results,
-        action,
-    ):
-
-        if not isinstance(
-            results,
-            list,
-        ):
-            return []
-
-        normalized = []
-
-        for result in results:
-
-            if not isinstance(
-                result,
-                dict,
-            ):
-                continue
-
-            item = dict(result)
-
-            item.setdefault(
-                "search_type",
-                action,
-            )
-
-            item.setdefault(
-                "source_type",
-                (
-                    "web"
-                    if action == "web_search"
-                    else "document"
-                ),
-            )
-
-            if not item.get("content"):
-                item["content"] = (
-                    item.get("text")
-                    or item.get("page_content")
-                    or ""
-                )
-
-            normalized.append(item)
-
-        return normalized
-
-    # ========================================================
-    # RESULT KEY
-    # ========================================================
-
-    def _result_key(self, result):
-
-        if not isinstance(
-            result,
-            dict,
-        ):
-            return None
-
-        source = (
-            result.get("source")
-            or result.get("filename")
-            or result.get("file_name")
-            or result.get("url")
-            or ""
-        )
-
-        chunk_id = (
-            result.get("chunk_id")
-            or result.get("id")
-            or result.get("table_index")
-            or ""
-        )
-
-        content = str(
-            result.get(
-                "content",
+            result["filename"] = (
                 result.get(
-                    "text",
-                    "",
-                ),
+                    "filename"
+                )
             )
-        )
 
-        return (
-            str(source),
-            str(chunk_id),
-            content[:500],
-        )
+            result["search_type"] = (
+                "postgresql_chunk_search"
+            )
 
-    # ========================================================
-    # DEDUPLICATION
-    # ========================================================
+            result["source_type"] = (
+                "table"
+                if result.get(
+                    "chunk_type"
+                ) == "Table"
+                else "document"
+            )
 
-    def _deduplicate_results(
-        self,
-        results,
-    ):
-
-        unique = []
-        seen = set()
-
-        for result in results:
-
-            key = self._result_key(
+            results.append(
                 result
             )
 
-            if key is None:
-                unique.append(result)
-                continue
+        return results
 
-            if key in seen:
-                continue
-
-            seen.add(key)
-            unique.append(result)
-
-        return unique
-
-    # ========================================================
-    # FALLBACK
-    # ========================================================
-
-    def _fallback_action(
-        self,
-        previous_action=None,
-    ):
-
-        web_available = callable(
-            getattr(
-                self.llm,
-                "web_search",
-                None,
-            )
-        )
-
-        if previous_action == "vector_search":
-            return "document_search"
-
-        if previous_action == "document_search":
-            return "table_search"
-
-        if previous_action == "table_search":
-
-            if web_available:
-                return "web_search"
-
-            return "vector_search"
-
-        if previous_action == "web_search":
-            return "vector_search"
-
-        return "vector_search"
-
-    # ========================================================
-    # DETERMINISTIC ROUTING
-    # ========================================================
-
-    def _deterministic_action(
-        self,
-        query,
-    ):
-
-        q = query.lower().strip()
-
-        document_patterns = [
-            "uploaded document",
-            "uploaded file",
-            "this document",
-            "this file",
-            "the document",
-            "the file",
-            "in the document",
-            "in this document",
-            "from the document",
-            "from this document",
-            "according to the document",
-            "according to this document",
-            "according to the paper",
-            "in the paper",
-            "from the paper",
-            "this paper",
-        ]
-
-        if any(
-            pattern in q
-            for pattern in document_patterns
-        ):
-            return "vector_search"
-
-        metadata_terms = [
-            "document title",
-            "title of the document",
-            "document name",
-            "file name",
-            "filename",
-            "document author",
-            "author of the document",
-            "document subject",
-            "how many pages",
-            "page count",
-            "number of pages",
-        ]
-
-        if any(
-            term in q
-            for term in metadata_terms
-        ):
-            return "document_search"
-
-        table_terms = [
-            "table",
-            "row",
-            "rows",
-            "column",
-            "columns",
-            "spreadsheet",
-            "excel",
-            "cell",
-            "sales total",
-            "total sales",
-            "revenue total",
-            "total revenue",
-        ]
-
-        if any(
-            term in q
-            for term in table_terms
-        ):
-            return "table_search"
-
-        return None
-
-    # ========================================================
-    # PLANNING
-    # ========================================================
-
-    def _plan_action(
-        self,
-        query,
-        previous_actions,
-        previous_evaluations,
-    ):
-
-        deterministic = (
-            self._deterministic_action(
-                query
-            )
-        )
-
-        if deterministic:
-
-            return {
-                "action": deterministic,
-                "query": query,
-                "reason": (
-                    "Selected using deterministic "
-                    "document/table routing."
-                ),
-            }
-
-        planner = getattr(
-            self.llm,
-            "plan_action",
-            None,
-        )
-
-        if callable(planner):
-
-            try:
-
-                plan = planner(
-                    query=query,
-                    previous_actions=(
-                        previous_actions
-                    ),
-                    previous_evaluations=(
-                        previous_evaluations
-                    ),
-                )
-
-                if isinstance(
-                    plan,
-                    dict,
-                ):
-
-                    action = plan.get(
-                        "action",
-                        "vector_search",
-                    )
-
-                    if action not in self.allowed_actions:
-                        action = "vector_search"
-
-                    if (
-                        action == "web_search"
-                        and not callable(
-                            getattr(
-                                self.llm,
-                                "web_search",
-                                None,
-                            )
-                        )
-                    ):
-                        action = "vector_search"
-
-                    return {
-                        "action": action,
-                        "query": (
-                            str(
-                                plan.get(
-                                    "query",
-                                    query,
-                                )
-                            ).strip()
-                            or query
-                        ),
-                        "reason": str(
-                            plan.get(
-                                "reason",
-                                "Model-selected retrieval strategy.",
-                            )
-                        ),
-                    }
-
-            except Exception as exc:
-
-                print(
-                    f"Model planner failed: {exc}"
-                )
-
-        return {
-            "action": self._fallback_action(
-                previous_actions[-1]
-                if previous_actions
-                else None
-            ),
-            "query": query,
-            "reason": (
-                "Planner unavailable; "
-                "using deterministic fallback."
-            ),
-        }
-
-    # ========================================================
-    # EVALUATE EVIDENCE
-    # ========================================================
-
-    def _evaluate_evidence(
-        self,
-        query,
-        results,
-        action,
-    ):
-
-        if not results:
-
-            return {
-                "sufficient": False,
-                "confidence": 0.0,
-                "reason": "No retrieval evidence.",
-                "recommended_action": (
-                    self._fallback_action(
-                        action
-                    )
-                ),
-            }
-
-        evaluator = getattr(
-            self.llm,
-            "evaluate_evidence",
-            None,
-        )
-
-        if callable(evaluator):
-
-            try:
-
-                evaluation = evaluator(
-                    query=query,
-                    results=results,
-                    action=action,
-                )
-
-                if isinstance(
-                    evaluation,
-                    dict,
-                ):
-
-                    recommended_action = (
-                        evaluation.get(
-                            "recommended_action",
-                            self._fallback_action(
-                                action
-                            ),
-                        )
-                    )
-
-                    if (
-                        recommended_action
-                        not in self.allowed_actions
-                    ):
-                        recommended_action = (
-                            self._fallback_action(
-                                action
-                            )
-                        )
-
-                    if (
-                        recommended_action == "web_search"
-                        and not callable(
-                            getattr(
-                                self.llm,
-                                "web_search",
-                                None,
-                            )
-                        )
-                    ):
-                        recommended_action = (
-                            "vector_search"
-                        )
-
-                    try:
-                        confidence = float(
-                            evaluation.get(
-                                "confidence",
-                                0.0,
-                            )
-                        )
-                    except Exception:
-                        confidence = 0.0
-
-                    confidence = max(
-                        0.0,
-                        min(
-                            confidence,
-                            1.0,
-                        ),
-                    )
-
-                    return {
-                        "sufficient": bool(
-                            evaluation.get(
-                                "sufficient",
-                                False,
-                            )
-                        ),
-                        "confidence": confidence,
-                        "reason": str(
-                            evaluation.get(
-                                "reason",
-                                "",
-                            )
-                        ),
-                        "recommended_action": (
-                            recommended_action
-                        ),
-                    }
-
-            except Exception as exc:
-
-                print(
-                    f"Evidence evaluator failed: {exc}"
-                )
-
-        return {
-            "sufficient": bool(results),
-            "confidence": 0.5,
-            "reason": (
-                "Evidence was retrieved."
-            ),
-            "recommended_action": (
-                self._fallback_action(
-                    action
-                )
-            ),
-        }
-
-    # ========================================================
-    # SOURCE TYPE
-    # ========================================================
-
-    def _determine_source_type(
-        self,
-        results,
-    ):
-
-        source_types = {
-            str(
-                result.get(
-                    "source_type",
-                    "",
-                )
-            ).lower()
-            for result in results
-            if isinstance(
-                result,
-                dict,
-            )
-        }
-
-        if "web" in source_types:
-            return "web"
-
-        if "table" in source_types:
-            return "table"
-
-        return "document"
-
-    # ========================================================
-    # FINAL ANSWER
-    # ========================================================
-
-    def _generate_answer(
-        self,
-        query,
-        chunks,
-        source_type,
-    ):
-
-        if not chunks:
-
-            return (
-                "I could not find sufficient "
-                "evidence to answer that question."
-            )
-
-        generator = getattr(
-            self.llm,
-            "generate_answer",
-            None,
-        )
-
-        if callable(generator):
-
-            try:
-
-                return generator(
-                    query=query,
-                    chunks=chunks,
-                    source_type=source_type,
-                )
-
-            except Exception as exc:
-
-                print(
-                    f"Model answer generation failed: {exc}"
-                )
-
-        # Safe fallback
-
-        for chunk in chunks:
-
-            if not isinstance(
-                chunk,
-                dict,
-            ):
-                continue
-
-            content = (
-                chunk.get("content")
-                or chunk.get("text")
-                or ""
-            )
-
-            if content:
-                return str(
-                    content
-                )
-
-        return (
-            "I could not generate an answer "
-            "from the retrieved evidence."
-        )
-
-    # ========================================================
-    # TRACE
-    # ========================================================
-
-    def _trace(
-        self,
-        state,
-        action,
-        details=None,
-    ):
-
-        state["trace"].append(
-            {
-                "step": len(
-                    state["trace"]
-                ) + 1,
-                "action": action,
-                "details": details or {},
-            }
-        )
-
-    # ========================================================
+    # --------------------------------------------------------
     # CONVERSATION
-    # ========================================================
+    # --------------------------------------------------------
 
-    def _conversation_context(self):
-
-        if not self.conversation_history:
-            return ""
-
-        recent = (
-            self.conversation_history[-8:]
-        )
-
-        lines = []
-
-        for message in recent:
-
-            if not isinstance(
-                message,
-                dict,
-            ):
-                continue
-
-            role = str(
-                message.get(
-                    "role",
-                    "",
-                )
-            ).upper()
-
-            content = str(
-                message.get(
-                    "content",
-                    "",
-                )
-            ).strip()
-
-            if not content:
-                continue
-
-            lines.append(
-                f"{role}: {content}"
-            )
-
-        return "\n".join(lines)
-
-    # ========================================================
-    # CREATE STATE
-    # ========================================================
-
-    def _create_state(
+    def create_conversation(
         self,
-        query,
+        user_id,
+        title="New Conversation",
     ):
 
-        return {
-            "query": query,
-            "original_query": query,
-            "action": None,
-            "results": [],
-            "all_results": [],
-            "answer": "",
-            "iterations": 0,
-            "success": False,
-            "trace": [],
-            "previous_actions": [],
-            "previous_evaluations": [],
-            "web_used": False,
-            "document_used": False,
-            "table_used": False,
-        }
+        conn = self.connect()
 
-    # ========================================================
-    # MAIN RUN
-    # ========================================================
+        cursor = conn.cursor()
 
-    def run(
+        cursor.execute(
+            """
+            INSERT INTO conversations (
+                user_id,
+                title
+            )
+            VALUES (%s, %s)
+            RETURNING id
+            """,
+            (
+                user_id,
+                title,
+            ),
+        )
+
+        conversation_id = (
+            cursor.fetchone()[0]
+        )
+
+        conn.commit()
+
+        return conversation_id
+
+    # --------------------------------------------------------
+    # MESSAGE
+    # --------------------------------------------------------
+
+    def save_message(
         self,
-        query,
+        conversation_id,
+        role,
+        content,
     ):
 
-        if not query or not query.strip():
+        conn = self.connect()
 
-            return {
-                "answer": "Please enter a question.",
-                "sources": [],
-                "action": None,
-                "success": False,
-                "iterations": 0,
-                "trace": [],
-            }
+        cursor = conn.cursor()
 
-        query = query.strip()
-
-        state = self._create_state(
-            query
+        cursor.execute(
+            """
+            INSERT INTO messages (
+                conversation_id,
+                role,
+                content
+            )
+            VALUES (%s, %s, %s)
+            """,
+            (
+                conversation_id,
+                role,
+                content,
+            ),
         )
 
-        working_query = query
+        conn.commit()
 
-        conversation_context = (
-            self._conversation_context()
+    # --------------------------------------------------------
+    # GET MESSAGES
+    # --------------------------------------------------------
+
+    def get_messages(
+        self,
+        conversation_id,
+    ):
+
+        conn = self.connect()
+
+        cursor = conn.cursor(
+            cursor_factory=RealDictCursor
         )
 
-        if conversation_context:
-
-            working_query = (
-                "Conversation context:\n"
-                + conversation_context
-                + "\n\nCurrent question:\n"
-                + query
-            )
-
-        while (
-            state["iterations"]
-            < self.max_iterations
-        ):
-
-            state["iterations"] += 1
-
-            iteration = state[
-                "iterations"
-            ]
-
-            # ------------------------------------------------
-            # PLAN
-            # ------------------------------------------------
-
-            plan = self._plan_action(
-                query=working_query,
-                previous_actions=(
-                    state["previous_actions"]
-                ),
-                previous_evaluations=(
-                    state["previous_evaluations"]
-                ),
-            )
-
-            action = plan.get(
-                "action",
-                "vector_search",
-            )
-
-            search_query = (
-                str(
-                    plan.get(
-                        "query",
-                        working_query,
-                    )
-                ).strip()
-                or working_query
-            )
-
-            reason = str(
-                plan.get(
-                    "reason",
-                    "",
-                )
-            )
-
-            state["action"] = action
-
-            state["previous_actions"].append(
-                action
-            )
-
-            if action == "web_search":
-                state["web_used"] = True
-
-            elif action in (
-                "vector_search",
-                "document_search",
-            ):
-                state["document_used"] = True
-
-            elif action == "table_search":
-                state["table_used"] = True
-
-            self._trace(
-                state,
-                "agent_plan",
-                {
-                    "iteration": iteration,
-                    "tool": action,
-                    "query": search_query,
-                    "reason": reason,
-                    "selected_sources": (
-                        self.selected_sources
-                    ),
-                },
-            )
-
-            # ------------------------------------------------
-            # EXECUTE
-            # ------------------------------------------------
-
-            try:
-
-                results = self.execute_tool(
-                    action,
-                    search_query,
-                )
-
-            except Exception as exc:
-
-                print(
-                    f"Tool execution failed: {exc}"
-                )
-
-                results = []
-
-            results = self._normalize_results(
-                results,
-                action,
-            )
-
-            state["results"] = results
-
-            state["all_results"].extend(
-                results
-            )
-
-            state["all_results"] = (
-                self._deduplicate_results(
-                    state["all_results"]
-                )
-            )
-
-            self._trace(
-                state,
-                "tool_result",
-                {
-                    "tool": action,
-                    "results": len(results),
-                    "total_unique_results": len(
-                        state["all_results"]
-                    ),
-                },
-            )
-
-            # ------------------------------------------------
-            # EVALUATE
-            # ------------------------------------------------
-
-            evaluation = (
-                self._evaluate_evidence(
-                    query=query,
-                    results=results,
-                    action=action,
-                )
-            )
-
-            state[
-                "previous_evaluations"
-            ].append(
-                evaluation
-            )
-
-            self._trace(
-                state,
-                "evidence_evaluation",
-                evaluation,
-            )
-
-            # ------------------------------------------------
-            # SUCCESS
-            # ------------------------------------------------
-
-            if (
-                evaluation["sufficient"]
-                and results
-            ):
-                break
-
-            if (
-                iteration
-                >= self.max_iterations
-            ):
-                break
-
-            recommended_action = (
-                evaluation.get(
-                    "recommended_action"
-                )
-            )
-
-            if (
-                recommended_action
-                not in self.allowed_actions
-            ):
-                recommended_action = (
-                    self._fallback_action(
-                        action
-                    )
-                )
-
-            self._trace(
-                state,
-                "replan",
-                {
-                    "next_action": (
-                        recommended_action
-                    ),
-                    "reason": evaluation.get(
-                        "reason",
-                        "",
-                    ),
-                },
-            )
-
-            working_query = query
-
-        # ====================================================
-        # FINAL EVIDENCE
-        # ====================================================
-
-        final_results = (
-            self._deduplicate_results(
-                state["all_results"]
-            )
+        cursor.execute(
+            """
+            SELECT
+                role,
+                content,
+                created_at
+            FROM messages
+            WHERE conversation_id = %s
+            ORDER BY created_at
+            """,
+            (conversation_id,),
         )
 
-        if not final_results:
-
-            state["success"] = False
-
-            state["answer"] = (
-                "I could not find sufficient "
-                "evidence to answer that question."
-            )
-
-            return {
-                "answer": state["answer"],
-                "sources": [],
-                "action": state["action"],
-                "success": False,
-                "iterations": state[
-                    "iterations"
-                ],
-                "trace": state[
-                    "trace"
-                ],
-            }
-
-        # ====================================================
-        # SOURCE TYPE
-        # ====================================================
-
-        source_type = (
-            self._determine_source_type(
-                final_results
-            )
-        )
-
-        # ====================================================
-        # ANSWER
-        # ====================================================
-
-        answer = self._generate_answer(
-            query=query,
-            chunks=final_results,
-            source_type=source_type,
-        )
-
-        if not answer:
-
-            answer = (
-                "Evidence was retrieved, "
-                "but no final answer was generated."
-            )
-
-        state["answer"] = str(
-            answer
-        ).strip()
-
-        state["success"] = True
-
-        self._trace(
-            state,
-            "answer_generated",
-            {
-                "source_type": source_type,
-                "evidence_count": len(
-                    final_results
-                ),
-                "selected_sources": (
-                    self.selected_sources
-                ),
-            },
-        )
-
-        return {
-            "answer": state[
-                "answer"
-            ],
-            "sources": final_results,
-            "action": state[
-                "action"
-            ],
-            "success": True,
-            "iterations": state[
-                "iterations"
-            ],
-            "trace": state[
-                "trace"
-            ],
-        }
+        return [
+            dict(row)
+            for row in cursor.fetchall()
+        ]
 
 
 # ============================================================
-# VECTOR DATABASE LOADING
+# FILE EXTRACTION
 # ============================================================
 
-def load_vector_database():
-    """
-    Try to load the project's existing vector database.
-
-    This function intentionally checks common implementations
-    rather than replacing your existing vector database.
-    """
-
-    candidates = [
-        ("vector_db", "VectorDatabase"),
-        ("vector_database", "VectorDatabase"),
-        ("database", "VectorDatabase"),
-        ("vectordb", "VectorDatabase"),
-    ]
-
-    for module_name, class_name in candidates:
-
-        try:
-
-            module = __import__(
-                module_name,
-                fromlist=[class_name],
-            )
-
-            cls = getattr(
-                module,
-                class_name,
-                None,
-            )
-
-            if cls is None:
-                continue
-
-            try:
-                db = cls()
-            except TypeError:
-                continue
-
-            return db
-
-        except Exception:
-            continue
-
-    return None
-
-
-# ============================================================
-# DOCUMENT EXTRACTION
-# ============================================================
-
-def extract_uploaded_document(
-    uploaded_file,
+def extract_file(
+    uploaded_file
 ):
-    """
-    Generic document representation.
 
-    Existing project-specific processing should remain
-    responsible for creating embeddings/tables.
+    filename = uploaded_file.name
 
-    This fallback makes uploaded files visible/searchable
-    where possible without changing the original features.
-    """
+    suffix = (
+        Path(filename)
+        .suffix
+        .lower()
+    )
 
-    suffix = Path(
-        uploaded_file.name
-    ).suffix.lower()
+    file_bytes = uploaded_file.getvalue()
 
-    data = {
-        "source": uploaded_file.name,
-        "filename": uploaded_file.name,
-        "file_name": uploaded_file.name,
-        "metadata": {
-            "uploaded_file_name": uploaded_file.name,
-            "filename": uploaded_file.name,
-        },
-        "text": "",
-        "content": "",
-        "tables": [],
+    text = ""
+
+    pages = []
+
+    tables = []
+
+    images = []
+
+    visuals = []
+
+    metadata = {
+        "uploaded_file_name": filename,
+        "filename": filename,
+        "file_type": suffix,
+        "file_size": len(
+            file_bytes
+        ),
     }
 
-    # --------------------------------------------------------
+    # ========================================================
     # TXT / MD
-    # --------------------------------------------------------
+    # ========================================================
 
     if suffix in {
         ".txt",
@@ -1782,50 +847,560 @@ def extract_uploaded_document(
         ".csv",
     }:
 
+        text = file_bytes.decode(
+            "utf-8",
+            errors="ignore",
+        )
+
+        if suffix == ".csv":
+
+            try:
+
+                dataframe = pd.read_csv(
+                    io.BytesIO(
+                        file_bytes
+                    )
+                )
+
+                rows = (
+                    dataframe
+                    .fillna("")
+                    .to_dict(
+                        orient="records"
+                    )
+                )
+
+                tables.append(
+                    {
+                        "table": rows,
+                        "page": 1,
+                        "source": filename,
+                    }
+                )
+
+            except Exception:
+                pass
+
+    # ========================================================
+    # PDF
+    # ========================================================
+
+    elif suffix == ".pdf":
+
         try:
 
-            raw = uploaded_file.getvalue()
+            from pypdf import PdfReader
 
-            text = raw.decode(
-                "utf-8",
-                errors="ignore",
+            reader = PdfReader(
+                io.BytesIO(
+                    file_bytes
+                )
             )
 
-            data["text"] = text
-            data["content"] = text
+            page_texts = []
 
-        except Exception:
-            pass
+            for page_number, page in enumerate(
+                reader.pages,
+                start=1,
+            ):
 
-    return data
+                page_text = (
+                    page.extract_text()
+                    or ""
+                )
+
+                page_texts.append(
+                    page_text
+                )
+
+                pages.append(
+                    {
+                        "page": page_number,
+                        "text": page_text,
+                    }
+                )
+
+            text = "\n\n".join(
+                page_texts
+            )
+
+            metadata[
+                "page_count"
+            ] = len(
+                reader.pages
+            )
+
+        except Exception as exc:
+
+            st.warning(
+                f"PDF extraction failed: {exc}"
+            )
+
+    # ========================================================
+    # DOCX
+    # ========================================================
+
+    elif suffix == ".docx":
+
+        try:
+
+            from docx import Document
+
+            document = Document(
+                io.BytesIO(
+                    file_bytes
+                )
+            )
+
+            paragraphs = [
+                paragraph.text
+                for paragraph
+                in document.paragraphs
+                if paragraph.text.strip()
+            ]
+
+            text = "\n\n".join(
+                paragraphs
+            )
+
+            # Tables from DOCX
+            for table in document.tables:
+
+                rows = []
+
+                for row in table.rows:
+
+                    values = [
+                        cell.text
+                        for cell
+                        in row.cells
+                    ]
+
+                    rows.append(
+                        values
+                    )
+
+                tables.append(
+                    {
+                        "table": rows,
+                        "page": 1,
+                        "source": filename,
+                    }
+                )
+
+        except Exception as exc:
+
+            st.warning(
+                f"DOCX extraction failed: {exc}"
+            )
+
+    # ========================================================
+    # XLSX
+    # ========================================================
+
+    elif suffix == ".xlsx":
+
+        try:
+
+            workbook = pd.ExcelFile(
+                io.BytesIO(
+                    file_bytes
+                )
+            )
+
+            for sheet_name in workbook.sheet_names:
+
+                dataframe = pd.read_excel(
+                    workbook,
+                    sheet_name=sheet_name,
+                )
+
+                rows = (
+                    dataframe
+                    .fillna("")
+                    .to_dict(
+                        orient="records"
+                    )
+                )
+
+                tables.append(
+                    {
+                        "table": rows,
+                        "sheet": sheet_name,
+                        "page": sheet_name,
+                        "source": filename,
+                    }
+                )
+
+                text += (
+                    f"\n\n"
+                    f"Sheet: {sheet_name}\n"
+                    f"{dataframe.to_string(index=False)}"
+                )
+
+        except Exception as exc:
+
+            st.warning(
+                f"XLSX extraction failed: {exc}"
+            )
+
+    return {
+        "text": text,
+        "metadata": metadata,
+        "tables": tables,
+        "images": images,
+        "visuals": visuals,
+        "pages": pages,
+        "source": filename,
+        "filename": filename,
+        "file_name": filename,
+    }
 
 
 # ============================================================
-# SESSION STATE
+# CHUNKING
 # ============================================================
 
-def initialize_session_state():
-
-    if "documents" not in st.session_state:
-        st.session_state.documents = []
-
-    if "uploaded_files" not in st.session_state:
-        st.session_state.uploaded_files = []
-
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    if "vector_db" not in st.session_state:
-        st.session_state.vector_db = None
-
-    if "llm" not in st.session_state:
-        st.session_state.llm = None
-
-    if "agent" not in st.session_state:
-        st.session_state.agent = None
+CHUNKING_METHODS = {
+    "Recursive": "recursive_chunking",
+    "Character": "character_chunking",
+    "Token": "token_chunking",
+    "Markdown": "markdown_chunking",
+    "Contextual": "contextual_chunking",
+    "Table": "table_chunking",
+    "Image": "image_chunking",
+    "Visual": "visual_chunking",
+    "Multimodal": "multimodal_chunking",
+}
 
 
-initialize_session_state()
+def create_chunks(
+    extracted,
+    method,
+    chunk_size,
+    chunk_overlap,
+):
+
+    engine = ChunkingEngine(
+        text=extracted.get(
+            "text",
+            "",
+        ),
+
+        metadata=extracted.get(
+            "metadata",
+            {},
+        ),
+
+        tables=extracted.get(
+            "tables",
+            [],
+        ),
+
+        images=extracted.get(
+            "images",
+            [],
+        ),
+
+        visuals=extracted.get(
+            "visuals",
+            [],
+        ),
+
+        pages=extracted.get(
+            "pages",
+            [],
+        ),
+
+        source=extracted.get(
+            "source",
+            "Unknown",
+        ),
+
+        chunk_size=chunk_size,
+
+        chunk_overlap=chunk_overlap,
+    )
+
+    method_name = CHUNKING_METHODS[
+        method
+    ]
+
+    chunk_function = getattr(
+        engine,
+        method_name,
+    )
+
+    chunks = chunk_function()
+
+    return chunks, engine
+
+
+# ============================================================
+# NORMALIZE CHUNKS FOR UI
+# ============================================================
+
+def normalize_chunk(
+    chunk
+):
+
+    result = dict(
+        chunk
+    )
+
+    result["content"] = (
+        result.get(
+            "content",
+            ""
+        )
+    )
+
+    result["source"] = (
+        result.get(
+            "source"
+        )
+        or result.get(
+            "metadata",
+            {}
+        ).get(
+            "source",
+            "Unknown",
+        )
+    )
+
+    result["search_type"] = (
+        "postgresql_chunk_search"
+    )
+
+    result["source_type"] = (
+        "table"
+        if result.get(
+            "chunk_type"
+        ) == "Table"
+        else "document"
+    )
+
+    return result
+
+
+# ============================================================
+# SESSION
+# ============================================================
+
+def initialize_state():
+
+    defaults = {
+        "authenticated": False,
+        "user": None,
+        "db": None,
+        "llm": None,
+        "conversation_id": None,
+        "messages": [],
+        "documents": [],
+        "last_chunks": [],
+    }
+
+    for key, value in defaults.items():
+
+        if key not in st.session_state:
+
+            st.session_state[
+                key
+            ] = value
+
+
+initialize_state()
+
+
+# ============================================================
+# DATABASE INITIALIZATION
+# ============================================================
+
+if st.session_state.db is None:
+
+    try:
+
+        st.session_state.db = (
+            PostgreSQLStore()
+        )
+
+        st.session_state.db.initialize()
+
+    except Exception as exc:
+
+        st.error(
+            "PostgreSQL connection failed."
+        )
+
+        st.exception(
+            exc
+        )
+
+        st.stop()
+
+
+# ============================================================
+# LOGIN / REGISTER
+# ============================================================
+
+if not st.session_state.authenticated:
+
+    st.title(
+        "📄 Enterprise Document Intelligence"
+    )
+
+    st.caption(
+        "PostgreSQL-backed Agentic RAG"
+    )
+
+    login_tab, register_tab = st.tabs(
+        [
+            "🔐 Login",
+            "📝 Register",
+        ]
+    )
+
+    # --------------------------------------------------------
+    # LOGIN
+    # --------------------------------------------------------
+
+    with login_tab:
+
+        username = st.text_input(
+            "Username",
+            key="login_username",
+        )
+
+        password = st.text_input(
+            "Password",
+            type="password",
+            key="login_password",
+        )
+
+        if st.button(
+            "Login",
+            use_container_width=True,
+        ):
+
+            if not username or not password:
+
+                st.warning(
+                    "Enter username and password."
+                )
+
+            else:
+
+                user = (
+                    st.session_state.db.authenticate(
+                        username,
+                        password,
+                    )
+                )
+
+                if user:
+
+                    st.session_state.authenticated = True
+
+                    st.session_state.user = user
+
+                    st.session_state.conversation_id = (
+                        st.session_state.db.create_conversation(
+                            user["id"],
+                            "Enterprise RAG",
+                        )
+                    )
+
+                    st.session_state.messages = []
+
+                    st.rerun()
+
+                else:
+
+                    st.error(
+                        "Invalid username or password."
+                    )
+
+    # --------------------------------------------------------
+    # REGISTER
+    # --------------------------------------------------------
+
+    with register_tab:
+
+        new_username = st.text_input(
+            "Username",
+            key="register_username",
+        )
+
+        new_password = st.text_input(
+            "Password",
+            type="password",
+            key="register_password",
+        )
+
+        confirm_password = st.text_input(
+            "Confirm password",
+            type="password",
+            key="register_confirm",
+        )
+
+        if st.button(
+            "Create account",
+            use_container_width=True,
+        ):
+
+            if not new_username or not new_password:
+
+                st.warning(
+                    "Username and password are required."
+                )
+
+            elif new_password != confirm_password:
+
+                st.error(
+                    "Passwords do not match."
+                )
+
+            else:
+
+                user = (
+                    st.session_state.db.create_user(
+                        new_username,
+                        new_password,
+                    )
+                )
+
+                if user:
+
+                    st.success(
+                        "Account created. You can now log in."
+                    )
+
+                else:
+
+                    st.error(
+                        "Username already exists or registration failed."
+                    )
+
+    st.stop()
+
+
+# ============================================================
+# LOAD LLM
+# ============================================================
+
+if st.session_state.llm is None:
+
+    try:
+
+        st.session_state.llm = GeminiModel()
+
+    except Exception as exc:
+
+        st.error(
+            f"LLM initialization failed: {exc}"
+        )
+
+        st.stop()
 
 
 # ============================================================
@@ -1837,33 +1412,8 @@ st.title(
 )
 
 st.caption(
-    "Agentic RAG • Document Search • Table Search • Web Search"
+    "PostgreSQL • Agentic RAG • Multimodal Chunking • Document Search • Table Search • Web Search"
 )
-
-
-# ============================================================
-# INITIALIZE LLM
-# ============================================================
-
-if st.session_state.llm is None:
-
-    try:
-
-        st.session_state.llm = (
-            GeminiModel()
-        )
-
-    except Exception as exc:
-
-        st.error(
-            f"LLM initialization failed: {exc}"
-        )
-
-        st.info(
-            "Check OPENROUTER_API_KEY and LLM_MODEL in your config.py/.env."
-        )
-
-        st.stop()
 
 
 # ============================================================
@@ -1873,24 +1423,78 @@ if st.session_state.llm is None:
 with st.sidebar:
 
     st.header(
-        "⚙️ Configuration"
+        "👤 Account"
     )
 
-    top_k = st.slider(
-        "Results per search",
-        min_value=1,
-        max_value=10,
-        value=5,
+    st.write(
+        f"Logged in as **{st.session_state.user['username']}**"
     )
 
-    max_iterations = st.slider(
-        "Maximum agent iterations",
-        min_value=1,
-        max_value=6,
-        value=4,
+    if st.button(
+        "Logout",
+        use_container_width=True,
+    ):
+
+        st.session_state.authenticated = False
+        st.session_state.user = None
+        st.session_state.messages = []
+        st.session_state.conversation_id = None
+
+        st.rerun()
+
+    st.divider()
+
+    # ========================================================
+    # CHUNKING CONFIGURATION
+    # ========================================================
+
+    st.header(
+        "🧩 Chunking"
+    )
+
+    chunking_method = st.selectbox(
+        "Chunking method",
+        options=list(
+            CHUNKING_METHODS.keys()
+        ),
+        index=list(
+            CHUNKING_METHODS.keys()
+        ).index(
+            "Multimodal"
+        ),
+    )
+
+    chunk_size = st.number_input(
+        "Chunk size",
+        min_value=100,
+        max_value=20000,
+        value=1000,
+        step=100,
+    )
+
+    chunk_overlap = st.number_input(
+        "Chunk overlap",
+        min_value=0,
+        max_value=5000,
+        value=200,
+        step=50,
+    )
+
+    if chunk_overlap >= chunk_size:
+
+        st.error(
+            "Chunk overlap must be smaller than chunk size."
+        )
+
+    st.caption(
+        "Selected chunking configuration is stored with the document in PostgreSQL."
     )
 
     st.divider()
+
+    # ========================================================
+    # UPLOAD
+    # ========================================================
 
     st.header(
         "📁 Documents"
@@ -1911,68 +1515,210 @@ with st.sidebar:
 
     if uploaded_files:
 
-        existing_names = {
-            item.get("filename")
-            for item in st.session_state.documents
-            if isinstance(
-                item,
-                dict,
-            )
-        }
+        if chunk_overlap < chunk_size:
 
-        for uploaded_file in uploaded_files:
+            if st.button(
+                "⬆️ Process & Store Documents",
+                use_container_width=True,
+            ):
 
-            if uploaded_file.name in existing_names:
-                continue
-
-            document = (
-                extract_uploaded_document(
-                    uploaded_file
+                progress = st.progress(
+                    0
                 )
-            )
 
-            st.session_state.documents.append(
-                document
-            )
+                total = len(
+                    uploaded_files
+                )
 
-            st.session_state.uploaded_files.append(
-                uploaded_file.name
-            )
+                for index, uploaded_file in enumerate(
+                    uploaded_files,
+                    start=1,
+                ):
 
-    if st.session_state.documents:
+                    try:
+
+                        # ------------------------------------
+                        # EXTRACT
+                        # ------------------------------------
+
+                        extracted = extract_file(
+                            uploaded_file
+                        )
+
+                        # ------------------------------------
+                        # CHUNK
+                        # ------------------------------------
+
+                        chunks, engine = create_chunks(
+                            extracted,
+                            chunking_method,
+                            chunk_size,
+                            chunk_overlap,
+                        )
+
+                        # ------------------------------------
+                        # SAVE ORIGINAL FILE
+                        # ------------------------------------
+
+                        document_id = (
+                            st.session_state.db.save_document(
+                                user_id=(
+                                    st.session_state.user[
+                                        "id"
+                                    ]
+                                ),
+
+                                filename=(
+                                    uploaded_file.name
+                                ),
+
+                                file_type=(
+                                    Path(
+                                        uploaded_file.name
+                                    ).suffix.lower()
+                                ),
+
+                                file_bytes=(
+                                    uploaded_file.getvalue()
+                                ),
+
+                                chunking_method=(
+                                    chunking_method
+                                ),
+
+                                chunk_size=(
+                                    chunk_size
+                                ),
+
+                                chunk_overlap=(
+                                    chunk_overlap
+                                ),
+
+                                metadata=(
+                                    extracted.get(
+                                        "metadata",
+                                        {},
+                                    )
+                                ),
+                            )
+                        )
+
+                        # ------------------------------------
+                        # SAVE CHUNKS
+                        # ------------------------------------
+
+                        st.session_state.db.save_chunks(
+                            document_id,
+                            chunks,
+                        )
+
+                        progress.progress(
+                            index / total
+                        )
+
+                        st.success(
+                            f"{uploaded_file.name}: "
+                            f"{len(chunks)} chunks stored."
+                        )
+
+                    except Exception as exc:
+
+                        st.error(
+                            f"Failed to process "
+                            f"{uploaded_file.name}: {exc}"
+                        )
+
+                st.session_state.documents = (
+                    st.session_state.db.get_documents(
+                        st.session_state.user[
+                            "id"
+                        ]
+                    )
+                )
+
+    # ========================================================
+    # EXISTING DOCUMENTS
+    # ========================================================
+
+    st.divider()
+
+    documents = (
+        st.session_state.db.get_documents(
+            st.session_state.user[
+                "id"
+            ]
+        )
+    )
+
+    st.session_state.documents = documents
+
+    if documents:
 
         st.success(
-            f"{len(st.session_state.documents)} document(s) loaded."
+            f"{len(documents)} document(s) in PostgreSQL."
         )
 
-        source_names = [
-            doc.get(
-                "filename",
-                doc.get(
-                    "source",
-                    "Unknown",
-                ),
-            )
-            for doc in st.session_state.documents
-            if isinstance(
-                doc,
-                dict,
-            )
+        document_options = {
+            document["filename"]:
+                document["id"]
+            for document in documents
+        }
+
+        selected_document_names = st.multiselect(
+            "Search only selected documents",
+            options=list(
+                document_options.keys()
+            ),
+            default=list(
+                document_options.keys()
+            ),
+        )
+
+        selected_document_ids = [
+            document_options[name]
+            for name in selected_document_names
         ]
-
-        selected_sources = st.multiselect(
-            "Search only selected sources",
-            options=source_names,
-            default=source_names,
-        )
 
     else:
 
-        selected_sources = []
+        selected_document_ids = []
 
         st.info(
-            "Upload documents to enable document retrieval."
+            "No documents uploaded yet."
         )
+
+    st.divider()
+
+    # ========================================================
+    # CHUNK TYPES
+    # ========================================================
+
+    st.header(
+        "🔎 Retrieval filters"
+    )
+
+    selected_chunk_types = st.multiselect(
+        "Chunk types",
+        options=[
+            "Recursive",
+            "Character",
+            "Token",
+            "Markdown",
+            "Context",
+            "Table",
+            "Image",
+            "Visual",
+        ],
+        default=[],
+        help="Leave empty to search every stored chunk.",
+    )
+
+    top_k = st.slider(
+        "Chunks to retrieve",
+        min_value=1,
+        max_value=20,
+        value=5,
+    )
 
     st.divider()
 
@@ -1983,55 +1729,173 @@ with st.sidebar:
 
         st.session_state.messages = []
 
-        st.rerun()
+        if st.session_state.conversation_id:
 
-    if st.button(
-        "🔄 Reset documents",
-        use_container_width=True,
-    ):
-
-        st.session_state.documents = []
-        st.session_state.uploaded_files = []
+            st.session_state.conversation_id = (
+                st.session_state.db.create_conversation(
+                    st.session_state.user["id"],
+                    "New Conversation",
+                )
+            )
 
         st.rerun()
 
 
 # ============================================================
-# VECTOR DATABASE
+# SEARCH
 # ============================================================
 
-if st.session_state.vector_db is None:
+def search_documents(
+    query
+):
 
-    st.session_state.vector_db = (
-        load_vector_database()
+    return (
+        st.session_state.db.search_chunks(
+            user_id=(
+                st.session_state.user[
+                    "id"
+                ]
+            ),
+
+            query=query,
+
+            selected_document_ids=(
+                selected_document_ids
+            ),
+
+            chunk_types=(
+                selected_chunk_types
+                or None
+            ),
+
+            top_k=top_k,
+        )
     )
 
 
 # ============================================================
-# CREATE AGENT
+# WEB SEARCH
 # ============================================================
 
-st.session_state.agent = (
-    EnterpriseRAGAgent(
-        vector_db=(
-            st.session_state.vector_db
-        ),
-        llm=(
-            st.session_state.llm
-        ),
-        documents=(
-            st.session_state.documents
-        ),
-        selected_sources=(
-            selected_sources
-        ),
-        conversation_history=(
-            st.session_state.messages
-        ),
-        top_k=top_k,
-        max_iterations=max_iterations,
+def web_search(
+    query
+):
+
+    method = getattr(
+        st.session_state.llm,
+        "web_search",
+        None,
     )
-)
+
+    if not callable(method):
+        return []
+
+    try:
+
+        results = method(
+            query=query,
+            max_results=top_k,
+        )
+
+        if not isinstance(
+            results,
+            list,
+        ):
+            return []
+
+        normalized = []
+
+        for result in results:
+
+            if not isinstance(
+                result,
+                dict,
+            ):
+                continue
+
+            item = dict(
+                result
+            )
+
+            item.setdefault(
+                "source_type",
+                "web",
+            )
+
+            item.setdefault(
+                "search_type",
+                "web_search",
+            )
+
+            item.setdefault(
+                "content",
+                item.get(
+                    "text",
+                    "",
+                ),
+            )
+
+            normalized.append(
+                item
+            )
+
+        return normalized
+
+    except Exception as exc:
+
+        st.warning(
+            f"Web search failed: {exc}"
+        )
+
+        return []
+
+
+# ============================================================
+# ANSWER GENERATION
+# ============================================================
+
+def generate_answer(
+    query,
+    chunks,
+):
+
+    generator = getattr(
+        st.session_state.llm,
+        "generate_answer",
+        None,
+    )
+
+    if not callable(generator):
+
+        if chunks:
+
+            return chunks[0].get(
+                "content",
+                "No answer available.",
+            )
+
+        return (
+            "I could not find sufficient evidence."
+        )
+
+    try:
+
+        return generator(
+            query=query,
+            chunks=chunks,
+            source_type="document",
+        )
+
+    except Exception as exc:
+
+        st.error(
+            f"Answer generation failed: {exc}"
+        )
+
+        return (
+            "I could not generate an answer "
+            "from the retrieved evidence."
+        )
 
 
 # ============================================================
@@ -2058,6 +1922,7 @@ for message in st.session_state.messages:
     with st.chat_message(
         role
     ):
+
         st.markdown(
             content
         )
@@ -2074,9 +1939,9 @@ query = st.chat_input(
 
 if query:
 
-    # --------------------------------------------------------
-    # USER MESSAGE
-    # --------------------------------------------------------
+    # ========================================================
+    # SAVE USER MESSAGE
+    # ========================================================
 
     st.session_state.messages.append(
         {
@@ -2085,43 +1950,84 @@ if query:
         }
     )
 
+    if st.session_state.conversation_id:
+
+        st.session_state.db.save_message(
+            st.session_state.conversation_id,
+            "user",
+            query,
+        )
+
     with st.chat_message(
         "user"
     ):
+
         st.markdown(
             query
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # ASSISTANT
-    # --------------------------------------------------------
+    # ========================================================
 
     with st.chat_message(
         "assistant"
     ):
 
         with st.spinner(
-            "Agent is searching and evaluating evidence..."
+            "Searching PostgreSQL chunks..."
         ):
 
-            result = (
-                st.session_state.agent.run(
-                    query
-                )
+            document_results = search_documents(
+                query
             )
 
-        answer = result.get(
-            "answer",
-            "No answer generated.",
-        )
+            # -----------------------------------------------
+            # IF DOCUMENT EVIDENCE IS WEAK
+            # -----------------------------------------------
+
+            if not document_results:
+
+                with st.spinner(
+                    "No strong document evidence. Searching web..."
+                ):
+
+                    web_results = web_search(
+                        query
+                    )
+
+                results = web_results
+
+            else:
+
+                results = document_results
+
+            # -----------------------------------------------
+            # GENERATE
+            # -----------------------------------------------
+
+            if results:
+
+                answer = generate_answer(
+                    query,
+                    results,
+                )
+
+            else:
+
+                answer = (
+                    "I could not find sufficient "
+                    "evidence in the uploaded documents "
+                    "or available web search."
+                )
 
         st.markdown(
             answer
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # METRICS
-        # ----------------------------------------------------
+        # ====================================================
 
         col1, col2, col3 = st.columns(
             3
@@ -2130,109 +2036,97 @@ if query:
         with col1:
 
             st.metric(
-                "Retrieval tool",
-                result.get(
-                    "action"
-                )
-                or "N/A",
+                "Retrieved chunks",
+                len(results),
             )
 
         with col2:
 
             st.metric(
-                "Iterations",
-                result.get(
-                    "iterations",
-                    0,
+                "Chunking",
+                (
+                    documents[0].get(
+                        "chunking_method",
+                        "N/A",
+                    )
+                    if documents
+                    else "N/A"
                 ),
             )
 
         with col3:
 
             st.metric(
-                "Evidence",
-                len(
-                    result.get(
-                        "sources",
-                        [],
-                    )
-                ),
+                "Storage",
+                "PostgreSQL",
             )
 
-        # ----------------------------------------------------
+        # ====================================================
         # SOURCES
-        # ----------------------------------------------------
+        # ====================================================
 
-        sources = result.get(
-            "sources",
-            [],
-        )
-
-        if sources:
+        if results:
 
             with st.expander(
                 "📚 Retrieved Sources"
             ):
 
                 for index, source in enumerate(
-                    sources,
+                    results,
                     start=1,
                 ):
 
-                    if not isinstance(
-                        source,
-                        dict,
-                    ):
-                        continue
-
                     source_name = (
                         source.get(
-                            "source"
-                        )
-                        or source.get(
                             "filename"
                         )
                         or source.get(
-                            "file_name"
+                            "source"
                         )
                         or source.get(
                             "url"
                         )
-                        or "Unknown source"
+                        or "Unknown"
                     )
 
-                    search_type = source.get(
-                        "search_type",
-                        "retrieval",
+                    chunk_type = source.get(
+                        "chunk_type",
+                        "Unknown",
                     )
 
                     score = source.get(
                         "similarity_score",
-                        source.get(
-                            "score",
-                            "",
-                        ),
+                        "",
+                    )
+
+                    page = source.get(
+                        "page",
+                        "",
                     )
 
                     st.markdown(
-                        f"**{index}. {source_name}**"
+                        f"### {index}. {source_name}"
                     )
 
                     st.caption(
-                        f"Search type: {search_type}"
+                        f"Chunk type: {chunk_type}"
                     )
 
-                    if score != "":
+                    if page:
+
                         st.caption(
-                            f"Score: {score}"
+                            f"Page/Sheet: {page}"
+                        )
+
+                    if score != "":
+
+                        st.caption(
+                            f"Relevance: {score}"
                         )
 
                     content = (
                         source.get(
                             "content"
-                        )
-                        or source.get(
-                            "text"
                         )
                         or ""
                     )
@@ -2242,47 +2136,14 @@ if query:
                         st.text(
                             str(
                                 content
-                            )[:2000]
+                            )[:3000]
                         )
 
                     st.divider()
 
-        # ----------------------------------------------------
-        # AGENT TRACE
-        # ----------------------------------------------------
-
-        trace = result.get(
-            "trace",
-            [],
-        )
-
-        if trace:
-
-            with st.expander(
-                "🔎 Agent Execution Trace"
-            ):
-
-                for step in trace:
-
-                    st.markdown(
-                        f"**Step {step.get('step')} — "
-                        f"{step.get('action')}**"
-                    )
-
-                    details = step.get(
-                        "details",
-                        {},
-                    )
-
-                    if details:
-
-                        st.json(
-                            details
-                        )
-
-    # --------------------------------------------------------
-    # SAVE ASSISTANT RESPONSE
-    # --------------------------------------------------------
+    # ========================================================
+    # SAVE ASSISTANT MESSAGE
+    # ========================================================
 
     st.session_state.messages.append(
         {
@@ -2290,6 +2151,14 @@ if query:
             "content": answer,
         }
     )
+
+    if st.session_state.conversation_id:
+
+        st.session_state.db.save_message(
+            st.session_state.conversation_id,
+            "assistant",
+            answer,
+        )
 
     st.rerun()
 
@@ -2302,24 +2171,35 @@ if not st.session_state.messages:
 
     st.markdown(
         """
-        ### 👋 Welcome
+        ## 👋 Welcome
 
-        Ask questions about your enterprise documents.
+        Your documents, original files, users, conversations,
+        and chunks are stored in **PostgreSQL**.
 
-        **Examples**
+        ### Current pipeline
 
-        - What is the main objective of this document?
-        - What are the key findings?
-        - What does the table show?
-        - What is the total revenue?
-        - Who is the author of the document?
-        - Compare the information across the uploaded documents.
-        - Search the web for the latest information about this topic.
+        `Login`
+        → `Upload`
+        → `Extract`
+        → `Select Chunking`
+        → `Chunk`
+        → `Store Chunks in PostgreSQL`
+        → `Retrieve`
+        → `Gemini`
+        → `Answer`
+
+        ### Supported chunking
+
+        - Recursive
+        - Character
+        - Token
+        - Markdown
+        - Contextual
+        - Table
+        - Image
+        - Visual
+        - Multimodal
+
+        Upload a document from the sidebar to begin.
         """
     )
-
-    if not st.session_state.documents:
-
-        st.info(
-            "👈 Upload a document from the sidebar to get started."
-        )
