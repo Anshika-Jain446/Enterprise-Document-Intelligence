@@ -39,7 +39,7 @@ class GeminiLLM:
                 model=LLM_MODEL,
                 messages=messages,
                 temperature=0,
-                max_tokens=self.MAX_TOKENS
+                max_tokens=1000,
             )
         )
 
