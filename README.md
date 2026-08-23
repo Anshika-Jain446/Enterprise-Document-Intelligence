@@ -40,7 +40,7 @@ Built with **Python, Streamlit, PostgreSQL, and Google Gemini**.
 | Document parsing | pypdf, python-docx, python-pptx, pandas, openpyxl |
 | Chunking | Custom `ChunkingEngine` (langchain-text-splitters, tiktoken) |
 | Retrieval | PostgreSQL full-text search |
-| LLM | Google Gemini API (`gemini-2.5-flash`, free tier) via `google-genai` |
+| LLM | Google Gemini API (`gemini-3.6-flash`, free tier) via `google-genai` |
 | Deployment | Railway (containerized app + linked PostgreSQL service) |
 
 ---
