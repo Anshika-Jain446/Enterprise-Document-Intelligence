@@ -65,7 +65,7 @@ Built with **Python, Streamlit, PostgreSQL, and Google Gemini**.
 |---|---|---|---|
 | `DATABASE_URL` | Yes | — | Full PostgreSQL connection string |
 | `GOOGLE_API_KEY` | Yes | — | Free key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
-| `LLM_MODEL` | No | `gemini-2.5-flash` | Any Gemini model name |
+| `LLM_MODEL` | No | `gemini-3.6-flash` | Any Gemini model name |
 | `ADMIN_USERNAME` | No | — | Promotes an existing username to admin on startup |
 | `CHUNK_SIZE` | No | `1000` | Default chunk size |
 | `CHUNK_OVERLAP` | No | `200` | Default chunk overlap |
