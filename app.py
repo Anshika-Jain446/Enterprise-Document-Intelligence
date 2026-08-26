@@ -1835,6 +1835,8 @@ class PostgreSQLStore:
             # DOCUMENT FILTER
             # ------------------------------------------------
 
+            document_filter_applied = False
+
             if selected_document_ids:
 
                 clean_ids = []
@@ -1857,6 +1859,8 @@ class PostgreSQLStore:
                     condition_params.append(
                         clean_ids
                     )
+
+                    document_filter_applied = True
 
             # ------------------------------------------------
             # CHUNK TYPE FILTER
@@ -1899,7 +1903,33 @@ class PostgreSQLStore:
             # The original app.py put user_id first.
             # ------------------------------------------------
 
-            sql = f"""
+            def build_sql(with_text_match):
+
+                text_match = """
+                    AND
+                    (
+                        to_tsvector(
+                            'english',
+                            COALESCE(c.content, '')
+                        )
+                        @@ plainto_tsquery(
+                            'english',
+                            %s
+                        )
+
+                        OR LOWER(
+                            COALESCE(c.content, '')
+                        )
+                        LIKE LOWER(%s)
+
+                        OR LOWER(
+                            COALESCE(d.filename, '')
+                        )
+                        LIKE LOWER(%s)
+                    )
+                """
+
+                return f"""
                 SELECT
                     c.id,
                     c.document_id,
@@ -1935,35 +1965,20 @@ class PostgreSQLStore:
 
                 WHERE
                     {where_clause}
-
-                    AND
-                    (
-                        to_tsvector(
-                            'english',
-                            COALESCE(c.content, '')
-                        )
-                        @@ plainto_tsquery(
-                            'english',
-                            %s
-                        )
-
-                        OR LOWER(
-                            COALESCE(c.content, '')
-                        )
-                        LIKE LOWER(%s)
-
-                        OR LOWER(
-                            COALESCE(d.filename, '')
-                        )
-                        LIKE LOWER(%s)
-                    )
+                    {text_match if with_text_match else ""}
 
                 ORDER BY
                     similarity_score DESC,
-                    c.id DESC
+                    c.document_id,
+                    c.chunk_id
 
                 LIMIT %s
             """
+
+            limit = max(
+                1,
+                int(top_k),
+            )
 
             params = [
                 query,
@@ -1971,18 +1986,39 @@ class PostgreSQLStore:
                 query,
                 f"%{query}%",
                 f"%{query}%",
-                max(
-                    1,
-                    int(top_k),
-                ),
+                limit,
             ]
 
             cursor.execute(
-                sql,
+                build_sql(True),
                 params,
             )
 
             rows = cursor.fetchall()
+
+            # ------------------------------------------------
+            # SCOPED FALLBACK
+            #
+            # Questions such as "what is this document about?"
+            # contain no distinctive keywords, so the full-text
+            # predicate matches nothing. When the user has
+            # explicitly scoped the chat to specific documents,
+            # return the leading chunks of those documents
+            # instead of no evidence at all.
+            # ------------------------------------------------
+
+            if not rows and document_filter_applied:
+
+                cursor.execute(
+                    build_sql(False),
+                    [
+                        query,
+                        *condition_params,
+                        limit,
+                    ],
+                )
+
+                rows = cursor.fetchall()
 
             conn.rollback()
 
@@ -1990,6 +2026,78 @@ class PostgreSQLStore:
                 dict(row)
                 for row in rows
             ]
+
+        except Exception:
+
+            conn.rollback()
+            raise
+
+        finally:
+
+            if cursor:
+                cursor.close()
+
+    # ========================================================
+    # COUNT INDEXED CHUNKS
+    # ========================================================
+
+    def count_document_chunks(
+        self,
+        user_id,
+        document_ids,
+    ):
+
+        clean_ids = []
+
+        for value in document_ids or []:
+
+            try:
+                clean_ids.append(
+                    int(value)
+                )
+            except Exception:
+                continue
+
+        if not clean_ids:
+            return {}
+
+        conn = self.connect()
+        cursor = None
+
+        try:
+
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT
+                    d.id,
+                    COUNT(c.id)
+
+                FROM public.documents d
+
+                LEFT JOIN public.document_chunks c
+                    ON c.document_id = d.id
+
+                WHERE d.user_id = %s
+                AND d.id = ANY(%s)
+
+                GROUP BY d.id
+                """,
+                (
+                    int(user_id),
+                    clean_ids,
+                ),
+            )
+
+            counts = {
+                int(row[0]): int(row[1])
+                for row in cursor.fetchall()
+            }
+
+            conn.rollback()
+
+            return counts
 
         except Exception:
 
@@ -3327,6 +3435,18 @@ def load_conversation_messages():
 # RETRIEVAL
 # ============================================================
 
+def selected_document_ids():
+
+    return [
+        document_id
+        for document_id
+        in (
+            st.session_state.selected_document_ids
+            or []
+        )
+    ]
+
+
 def retrieve_documents(
     query,
     chunk_types=None,
@@ -3334,12 +3454,14 @@ def retrieve_documents(
 
     user = st.session_state.user
 
-    return (
+    document_ids = selected_document_ids()
+
+    results = (
         st.session_state.db.search_chunks(
             user_id=user["id"],
             query=query,
             selected_document_ids=(
-                st.session_state.selected_document_ids
+                document_ids
                 or None
             ),
             chunk_types=(
@@ -3354,6 +3476,96 @@ def retrieve_documents(
         )
     )
 
+    print(
+        "RETRIEVAL QUERY:",
+        query,
+        "| SELECTED DOCUMENTS:",
+        document_ids,
+        "| CHUNK TYPES:",
+        chunk_types,
+        "| RETRIEVED CHUNKS:",
+        len(results),
+        "| CHUNK SOURCES:",
+        [
+            (
+                chunk.get("document_id"),
+                chunk.get("filename"),
+            )
+            for chunk in results
+        ],
+    )
+
+    return results
+
+
+def selected_documents_unavailable_message():
+    """Explain why a scoped retrieval produced no evidence."""
+
+    document_ids = selected_document_ids()
+
+    try:
+
+        counts = (
+            st.session_state.db.count_document_chunks(
+                st.session_state.user["id"],
+                document_ids,
+            )
+        )
+
+    except Exception as exc:
+
+        return (
+            "I could not search the selected document(s) because the "
+            f"document index could not be read: {exc}"
+        )
+
+    missing = []
+
+    for document_id in document_ids:
+
+        try:
+            document_id = int(document_id)
+        except Exception:
+            continue
+
+        if document_id not in counts:
+            missing.append(document_id)
+
+    if missing:
+
+        return (
+            "The selected document(s) are no longer available in the "
+            "database. Please re-select or re-upload them."
+        )
+
+    unindexed = [
+        document_id
+        for document_id, count in counts.items()
+        if count == 0
+    ]
+
+    if unindexed:
+
+        return (
+            "The document is selected, but it has no indexed content. "
+            "Please re-index (re-upload) the document."
+        )
+
+    if st.session_state.selected_chunk_types:
+
+        return (
+            "The document is selected and indexed, but no chunks match "
+            "the active chunk-type filter "
+            f"({', '.join(st.session_state.selected_chunk_types)}). "
+            "Clear the chunk-type filter and try again."
+        )
+
+    return (
+        "The document is selected, but I could not retrieve its indexed "
+        "content. Please re-index the document or check the document "
+        "index."
+    )
+
 
 # ============================================================
 # RAG
@@ -3362,6 +3574,22 @@ def retrieve_documents(
 def perform_rag(query):
 
     llm = st.session_state.llm
+
+    # --------------------------------------------------------
+    # Documents explicitly selected in the UI restrict the
+    # whole pipeline: retrieval is filtered to them, and the
+    # assistant never silently answers from the web or from
+    # model knowledge instead.
+    # --------------------------------------------------------
+
+    document_scope = selected_document_ids()
+
+    print(
+        "USER QUERY:",
+        query,
+        "| SELECTED DOCUMENTS:",
+        document_scope,
+    )
 
     # --------------------------------------------------------
     # No LLM.
@@ -3419,6 +3647,22 @@ def perform_rag(query):
     action = plan.get(
         "action",
         "vector_search",
+    )
+
+    # --------------------------------------------------------
+    # A selected document is an explicit instruction to answer
+    # from that document, so never plan a web search for it.
+    # --------------------------------------------------------
+
+    if document_scope and action == "web_search":
+
+        action = "vector_search"
+
+    print(
+        "RETRIEVAL ACTION:",
+        action,
+        "| PLANNER REASON:",
+        plan.get("reason"),
     )
 
     search_query = str(
@@ -3631,6 +3875,47 @@ def perform_rag(query):
                 local_results,
                 "documents",
             )
+
+    # --------------------------------------------------------
+    # Scoped chat: answer from the selected documents, or say
+    # exactly why their content could not be retrieved. Never
+    # fall through to the web or to plain model knowledge.
+    # --------------------------------------------------------
+
+    if document_scope:
+
+        if local_results:
+
+            answer = llm.generate_answer(
+                query=query,
+                chunks=local_results,
+                source_type="uploaded documents",
+            )
+
+            return (
+                answer,
+                local_results,
+                "documents",
+            )
+
+        try:
+
+            message = (
+                selected_documents_unavailable_message()
+            )
+
+        except Exception as exc:
+
+            message = (
+                "The document is selected, but retrieval failed: "
+                f"{exc}"
+            )
+
+        return (
+            message,
+            [],
+            "error",
+        )
 
     # --------------------------------------------------------
     # Web fallback.
