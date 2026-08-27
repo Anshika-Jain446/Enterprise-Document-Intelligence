@@ -24,6 +24,7 @@ openpyxl
 # Image OCR (requires the Tesseract OCR engine installed on the host)
 pillow
 pytesseract
+pymupdf
 
 # Chunking helpers
 langchain-text-splitters
