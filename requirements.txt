@@ -21,6 +21,10 @@ python-docx
 python-pptx
 openpyxl
 
+# Image OCR (requires the Tesseract OCR engine installed on the host)
+pillow
+pytesseract
+
 # Chunking helpers
 langchain-text-splitters
 tiktoken

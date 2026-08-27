@@ -90,6 +90,17 @@ except Exception:
     CHUNK_OVERLAP = 100
 
 
+IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+    ".tiff",
+    ".tif",
+    ".webp",
+}
+
+
 SUPPORTED_FILES_CONFIG = config_value(
     "SUPPORTED_FILES",
     [
@@ -102,6 +113,7 @@ SUPPORTED_FILES_CONFIG = config_value(
         ".txt",
         ".md",
         ".markdown",
+        *sorted(IMAGE_EXTENSIONS),
     ],
 )
 
@@ -125,6 +137,9 @@ SUPPORTED_EXTENSIONS = {
     )
     for item in SUPPORTED_FILES
 }
+
+# Images are always accepted; they are read with OCR.
+SUPPORTED_EXTENSIONS |= IMAGE_EXTENSIONS
 
 
 DATABASE_URL = str(
@@ -183,6 +198,18 @@ try:
     from pptx import Presentation
 except ImportError:
     Presentation = None
+
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
 
 
 # ============================================================
@@ -2555,6 +2582,48 @@ class PostgreSQLStore:
 # DOCUMENT EXTRACTION
 # ============================================================
 
+def extract_text_from_image(file_bytes):
+
+    if Image is None:
+
+        raise RuntimeError(
+            "Image support requires Pillow. "
+            "Install pillow."
+        )
+
+    if pytesseract is None:
+
+        raise RuntimeError(
+            "Image text extraction requires pytesseract. "
+            "Install pytesseract and the Tesseract OCR "
+            "engine."
+        )
+
+    try:
+
+        with Image.open(
+            io.BytesIO(file_bytes)
+        ) as image:
+
+            image.load()
+
+            if image.mode not in {"L", "RGB"}:
+                image = image.convert("RGB")
+
+            text = pytesseract.image_to_string(image)
+
+    except RuntimeError:
+        raise
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            f"Could not read image file: {exc}"
+        ) from exc
+
+    return str(text or "")
+
+
 def extract_document(
     filename,
     file_bytes,
@@ -2821,6 +2890,30 @@ def extract_document(
         ]
 
     # ========================================================
+    # IMAGES (OCR)
+    # ========================================================
+
+    if extension in IMAGE_EXTENSIONS:
+
+        text = extract_text_from_image(file_bytes)
+
+        if text and text.strip():
+
+            return [
+                {
+                    "page": 1,
+                    "content": text.strip(),
+                    "chunk_type": "Image",
+                    "metadata": {
+                        "page": 1,
+                        "source_type": "image",
+                    },
+                }
+            ]
+
+        return []
+
+    # ========================================================
     # TXT / MARKDOWN
     # ========================================================
 
@@ -3007,6 +3100,11 @@ def chunk_document(
                 "chunk_type",
                 chunk_type,
             )
+
+            # OCR output keeps its Image type so the chunk-type
+            # filter in the chat sidebar can select it.
+            if chunk_type == "Image":
+                chunk["chunk_type"] = "Image"
 
             content_value = str(
                 chunk.get(
@@ -4746,6 +4844,13 @@ def documents_page():
                         )
 
                         if not extracted:
+
+                            if extension in IMAGE_EXTENSIONS:
+
+                                raise ValueError(
+                                    "No readable text was found in "
+                                    "this image."
+                                )
 
                             raise ValueError(
                                 "No text or data could be extracted."

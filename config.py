@@ -183,6 +183,13 @@ SUPPORTED_FILES = [
     ".xlsx",
     ".xls",
     ".pptx",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".bmp",
+    ".tiff",
+    ".tif",
+    ".webp",
 ]
 
 
