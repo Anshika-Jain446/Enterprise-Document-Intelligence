@@ -212,6 +212,12 @@ except ImportError:
     pytesseract = None
 
 
+try:
+    from ocr import OCRProcessor
+except ImportError:
+    OCRProcessor = None
+
+
 # ============================================================
 # STREAMLIT CONFIG
 # ============================================================
@@ -2583,6 +2589,36 @@ class PostgreSQLStore:
 # ============================================================
 
 def extract_text_from_image(file_bytes):
+
+    # --------------------------------------------------------
+    # Preferred path: the project's own OCR processor, which
+    # also preprocesses the image before running Tesseract.
+    # --------------------------------------------------------
+
+    if OCRProcessor is not None:
+
+        try:
+            processor = OCRProcessor()
+
+        except Exception:
+            # PyMuPDF/pytesseract missing: fall back below.
+            processor = None
+
+        if processor is not None:
+
+            try:
+                return str(
+                    processor.extract_text_from_bytes(
+                        file_bytes
+                    )
+                    or ""
+                )
+
+            except Exception as exc:
+
+                raise RuntimeError(
+                    f"Could not read image file: {exc}"
+                ) from exc
 
     if Image is None:
 
