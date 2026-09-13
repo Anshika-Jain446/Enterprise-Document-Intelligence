@@ -44,6 +44,7 @@ class EnterpriseRAGAgent:
         top_k=5,
         max_iterations=4,
         source_mode="documents",
+        allow_web=False,
     ):
         self.vector_db = vector_db
         self.llm = llm
@@ -78,6 +79,7 @@ class EnterpriseRAGAgent:
             source_mode = "documents"
 
         self.source_mode = source_mode
+        self.allow_web = bool(allow_web)
 
         self.top_k = max(
             1,
@@ -1004,6 +1006,9 @@ class EnterpriseRAGAgent:
     # ============================================================
 
     def _web_search(self, query):
+        if not self.allow_web:
+            return []
+
         if not query or not query.strip():
             return []
 
@@ -1446,7 +1451,7 @@ class EnterpriseRAGAgent:
                 ),
             }
 
-        if self.source_mode == "web":
+        if self.source_mode == "web" and self.allow_web:
             return {
                 "action": "web_search",
                 "query": query,
@@ -1456,7 +1461,7 @@ class EnterpriseRAGAgent:
                 ),
             }
 
-        if self.source_mode == "documents_and_web":
+        if self.source_mode == "documents_and_web" and self.allow_web:
             return {
                 "action": "web_search",
                 "query": query,
@@ -1576,7 +1581,7 @@ class EnterpriseRAGAgent:
                     action = "vector_search"
 
             elif self.source_mode == "web":
-                action = "web_search"
+                action = "web_search" if self.allow_web else "vector_search"
 
             elif self.source_mode == "documents_and_web":
                 # Documents remain the first retrieval source.
@@ -1845,7 +1850,11 @@ class EnterpriseRAGAgent:
     def run(
         self,
         query,
+        allow_web=None,
     ):
+        if allow_web is not None:
+            self.allow_web = bool(allow_web)
+
         if not query or not query.strip():
             return {
                 "answer": (
@@ -1946,7 +1955,13 @@ class EnterpriseRAGAgent:
                     else action
                 )
             elif self.source_mode == "web":
-                action = "web_search"
+                action = "web_search" if self.allow_web else "vector_search"
+            elif (
+                self.source_mode == "documents_and_web"
+                and not self.allow_web
+                and action == "web_search"
+            ):
+                action = "vector_search"
 
             state["action"] = action
 
@@ -2155,7 +2170,13 @@ class EnterpriseRAGAgent:
                 if recommended == "web_search":
                     recommended = "vector_search"
             elif self.source_mode == "web":
-                recommended = "web_search"
+                recommended = "web_search" if self.allow_web else "vector_search"
+            elif (
+                self.source_mode == "documents_and_web"
+                and not self.allow_web
+                and recommended == "web_search"
+            ):
+                recommended = "vector_search"
 
             # Avoid endlessly repeating
             # exactly the same failed action.
@@ -2252,6 +2273,30 @@ class EnterpriseRAGAgent:
                 },
             )
 
+            if (
+                self.source_mode in {
+                    "documents",
+                    "documents_and_web",
+                }
+                and not self.allow_web
+            ):
+                return {
+                    "answer": (
+                        "I couldn't find sufficient evidence "
+                        "in your stored documents. Would you "
+                        "like me to search the web?"
+                    ),
+                    "sources": [],
+                    "action": "web_search",
+                    "success": False,
+                    "iterations": state[
+                        "iterations"
+                    ],
+                    "trace": state["trace"],
+                    "needs_web_permission": True,
+                    "web_allowed": False,
+                }
+
             return {
                 "answer": (
                     "I could not find sufficient "
@@ -2264,6 +2309,10 @@ class EnterpriseRAGAgent:
                     "iterations"
                 ],
                 "trace": state["trace"],
+            "needs_web_permission": False,
+            "web_allowed": self.allow_web,
+                "needs_web_permission": False,
+                "web_allowed": self.allow_web,
             }
 
         # ========================================================
