@@ -608,6 +608,70 @@ class VectorDatabase:
             self.save()
 
     # ============================================================
+    # REBUILD STORED INDEX
+    # ============================================================
+
+    def rebuild_index(
+        self,
+        persist=True,
+    ):
+        """
+        Re-embed all currently stored chunks and rebuild FAISS.
+
+        Use this once after upgrading the embedding/search-text logic
+        so an old FAISS index cannot remain paired with newer chunk
+        metadata.
+        """
+        if not self.documents:
+            if self.exists():
+                self.load()
+
+        if not self.documents:
+            self.index = None
+
+            if persist:
+                self.save()
+
+            return {
+                "status": "empty",
+                "chunks": 0,
+            }
+
+        # Ensure every legacy chunk receives current metadata fields.
+        normalized = []
+
+        for number, chunk in enumerate(
+            self.documents,
+            start=1,
+        ):
+            if not isinstance(
+                chunk,
+                dict,
+            ):
+                continue
+
+            normalized.append(
+                self._normalize_chunk(
+                    chunk,
+                    chunk_number=number,
+                )
+            )
+
+        self.documents = normalized
+
+        self._rebuild_from_documents(
+            persist=persist,
+        )
+
+        return {
+            "status": "rebuilt",
+            "chunks": len(
+                self.documents
+            ),
+            "sources": self.get_sources(),
+        }
+
+    # ============================================================
     # CREATE INDEX
     # ============================================================
 
@@ -1182,6 +1246,22 @@ class VectorDatabase:
         ):
             self._rebuild_from_documents()
 
+        # Legacy indexes may contain embeddings generated only from
+        # `content`. Rebuild once when the stored chunks do not carry
+        # the current searchable representation.
+        elif (
+            self.documents
+            and any(
+                not chunk.get("_search_text")
+                for chunk in self.documents
+                if isinstance(
+                    chunk,
+                    dict,
+                )
+            )
+        ):
+            self._rebuild_from_documents()
+
         print(
             f"Vector Database Loaded: "
             f"{len(self.documents)} chunks."
@@ -1725,6 +1805,76 @@ class VectorDatabase:
         )
 
     # ============================================================
+    # DOCUMENT FILTER MATCHING
+    # ============================================================
+
+    @classmethod
+    def _matches_document_filter(
+        cls,
+        chunk: Dict[str, Any],
+        allowed_values,
+    ) -> bool:
+        """
+        Match a requested document against all identifiers that may
+        exist in a chunk.
+
+        This fixes the common mismatch where the UI sends a
+        document_id while FAISS metadata stores the filename in
+        `source`.
+        """
+        if not allowed_values:
+            return True
+
+        candidates = []
+
+        for key in (
+            "document_id",
+            "source",
+            "file_name",
+            "filename",
+            "name",
+        ):
+            value = chunk.get(key)
+
+            if value is None:
+                continue
+
+            candidates.append(
+                str(value).strip()
+            )
+
+            candidates.append(
+                cls._document_key(value)
+            )
+
+        candidate_keys = {
+            value.casefold()
+            for value in candidates
+            if value
+        }
+
+        for allowed in allowed_values:
+            allowed_text = str(
+                allowed
+            ).strip()
+
+            if not allowed_text:
+                continue
+
+            if allowed_text.casefold() in candidate_keys:
+                return True
+
+            if (
+                cls._document_key(
+                    allowed_text
+                )
+                in candidate_keys
+            ):
+                return True
+
+        return False
+
+    # ============================================================
     # SEARCH
     # ============================================================
 
@@ -1793,15 +1943,17 @@ class VectorDatabase:
         allowed_sources = None
 
         if sources:
-
             allowed_sources = {
-                self._document_key(
-                    source
-                )
+                str(source).strip().casefold()
                 for source in self._normalize_sources(
                     sources
                 )
+                if str(source).strip()
             }
+
+            # Also allow document IDs, not only filenames.
+            # The actual matching is performed against all common
+            # chunk identifiers below.
 
         # --------------------------------------------------------
         # Chunk type filter
@@ -1852,13 +2004,20 @@ class VectorDatabase:
             or allowed_types
         ) else 3
 
-        candidate_k = min(
-            max(
-                requested_k * multiplier,
-                requested_k,
-            ),
-            self.index.ntotal,
-        )
+        if allowed_sources or allowed_types:
+            # For the current project size, searching the complete
+            # index is cheap and prevents relevant filtered chunks
+            # from being missed simply because they rank below the
+            # first 10 * top_k candidates.
+            candidate_k = self.index.ntotal
+        else:
+            candidate_k = min(
+                max(
+                    requested_k * multiplier,
+                    requested_k,
+                ),
+                self.index.ntotal,
+            )
 
         distances, indices = (
             self.index.search(
@@ -1890,20 +2049,13 @@ class VectorDatabase:
             # Source filtering
             # ----------------------------------------------------
 
-            chunk_source = (
-                self._document_key(
-                    chunk.get(
-                        "source",
-                        "",
-                    )
-                )
-            )
-
             if (
                 allowed_sources
                 is not None
-                and chunk_source
-                not in allowed_sources
+                and not self._matches_document_filter(
+                    chunk,
+                    allowed_sources,
+                )
             ):
                 continue
 
@@ -1971,6 +2123,78 @@ class VectorDatabase:
                 break
 
         return results
+
+    # ============================================================
+    # COMPATIBILITY SEARCH API
+    # ============================================================
+
+    def search_chunks(
+        self,
+        query,
+        top_k=5,
+        sources=None,
+        chunk_types=None,
+        document_ids=None,
+        user_id=None,
+    ):
+        """
+        Compatibility wrapper used by retrieval layers.
+
+        `document_ids` is treated exactly like `sources`, but the
+        matcher accepts either a stored filename/source or a
+        document_id.
+
+        `user_id` is optional. If chunks contain user_id metadata,
+        it is enforced. If legacy chunks do not contain user_id,
+        they remain searchable for backward compatibility.
+        """
+        requested_documents = (
+            document_ids
+            if document_ids is not None
+            else sources
+        )
+
+        results = self.search(
+            query=query,
+            top_k=top_k,
+            sources=requested_documents,
+            chunk_types=chunk_types,
+        )
+
+        if user_id is None:
+            return results
+
+        user_text = str(
+            user_id
+        ).strip().casefold()
+
+        if not user_text:
+            return results
+
+        # Only enforce user ownership when the stored chunk actually
+        # carries ownership metadata. This keeps old indexes usable.
+        filtered = []
+
+        for result in results:
+            stored_user = (
+                result.get("user_id")
+                or result.get("owner_id")
+                or result.get("uploaded_by")
+            )
+
+            if stored_user is None:
+                filtered.append(result)
+                continue
+
+            if (
+                str(stored_user)
+                .strip()
+                .casefold()
+                == user_text
+            ):
+                filtered.append(result)
+
+        return filtered
 
     # ============================================================
     # IMAGE-SPECIFIC SEARCH
