@@ -43,6 +43,7 @@ class EnterpriseRAGAgent:
         conversation_history=None,
         top_k=5,
         max_iterations=4,
+        source_mode="documents",
     ):
         self.vector_db = vector_db
         self.llm = llm
@@ -58,6 +59,25 @@ class EnterpriseRAGAgent:
         self.conversation_history = (
             conversation_history or []
         )
+
+        # ========================================================
+        # SOURCE MODE
+        # ========================================================
+        # documents = stored/indexed documents only (DEFAULT)
+        # web = web only
+        # documents_and_web = documents first, web allowed as fallback
+        source_mode = str(
+            source_mode or "documents"
+        ).strip().lower()
+
+        if source_mode not in {
+            "documents",
+            "web",
+            "documents_and_web",
+        }:
+            source_mode = "documents"
+
+        self.source_mode = source_mode
 
         self.top_k = max(
             1,
@@ -1426,12 +1446,33 @@ class EnterpriseRAGAgent:
                 ),
             }
 
+        if self.source_mode == "web":
+            return {
+                "action": "web_search",
+                "query": query,
+                "reason": (
+                    "Web search selected "
+                    "as the active source."
+                ),
+            }
+
+        if self.source_mode == "documents_and_web":
+            return {
+                "action": "web_search",
+                "query": query,
+                "reason": (
+                    "Document retrieval was "
+                    "insufficient and combined "
+                    "source mode allows web search."
+                ),
+            }
+
         return {
-            "action": "web_search",
+            "action": "vector_search",
             "query": query,
             "reason": (
-                "Use external evidence "
-                "after local retrieval."
+                "Document-only mode: continue "
+                "with stored document retrieval."
             ),
         }
 
@@ -1466,6 +1507,19 @@ class EnterpriseRAGAgent:
                     + "\n\nCurrent question:\n"
                     + query
                 )
+
+            planning_query = (
+                "SOURCE MODE: "
+                + self.source_mode
+                + "\n\nSOURCE POLICY:\n"
+                "- documents: search stored/indexed documents only; "
+                "do not use web_search.\n"
+                "- web: use web_search only.\n"
+                "- documents_and_web: search documents first; "
+                "web is allowed only after document retrieval is insufficient.\n"
+                "- an empty document selection means all stored/indexed documents.\n\n"
+                + planning_query
+            )
 
             plan = self.llm.plan_action(
                 query=planning_query,
@@ -1511,6 +1565,27 @@ class EnterpriseRAGAgent:
                 str,
             ) or not search_query.strip():
                 search_query = query
+
+            # ====================================================
+            # HARD SOURCE POLICY
+            # ====================================================
+            # Never allow the LLM planner to override the user's
+            # selected source mode.
+            if self.source_mode == "documents":
+                if action == "web_search":
+                    action = "vector_search"
+
+            elif self.source_mode == "web":
+                action = "web_search"
+
+            elif self.source_mode == "documents_and_web":
+                # Documents remain the first retrieval source.
+                # Web is allowed only after local evidence fails.
+                if (
+                    not state["previous_actions"]
+                    and action == "web_search"
+                ):
+                    action = "vector_search"
 
             return {
                 **plan,
@@ -1580,11 +1655,16 @@ class EnterpriseRAGAgent:
                 f"{error}"
             )
 
-        next_action = (
-            "web_search"
-            if action != "web_search"
-            else "vector_search"
-        )
+        if self.source_mode == "web":
+            next_action = "web_search"
+        elif self.source_mode == "documents_and_web":
+            next_action = (
+                "web_search"
+                if action != "web_search"
+                else "vector_search"
+            )
+        else:
+            next_action = "vector_search"
 
         return {
             "sufficient": False,
@@ -1856,6 +1936,18 @@ class EnterpriseRAGAgent:
             ) or not search_query.strip():
                 search_query = working_query
 
+            # ====================================================
+            # FINAL SOURCE GUARD
+            # ====================================================
+            if self.source_mode == "documents":
+                action = (
+                    "vector_search"
+                    if action == "web_search"
+                    else action
+                )
+            elif self.source_mode == "web":
+                action = "web_search"
+
             state["action"] = action
 
             state[
@@ -2055,6 +2147,15 @@ class EnterpriseRAGAgent:
                 recommended = fallback[
                     "action"
                 ]
+
+            # ====================================================
+            # SOURCE POLICY ON REPLANNING
+            # ====================================================
+            if self.source_mode == "documents":
+                if recommended == "web_search":
+                    recommended = "vector_search"
+            elif self.source_mode == "web":
+                recommended = "web_search"
 
             # Avoid endlessly repeating
             # exactly the same failed action.
