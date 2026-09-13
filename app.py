@@ -3619,9 +3619,18 @@ def retrieve_documents(
     query,
     chunk_types=None,
 ):
+    """Retrieve from stored documents before any web fallback.
+
+    Selected documents are searched through MultiDocumentRetriever.
+    With no selection, PostgreSQL is used first because it is the
+    authoritative user/document index; the VectorDatabase is then used
+    as a semantic fallback. This prevents an empty document selection
+    from accidentally becoming a web-search request.
+    """
+
     user = st.session_state.user
 
-    if not user:
+    if not user or not query or not str(query).strip():
         return []
 
     document_ids = selected_document_ids()
@@ -3635,98 +3644,58 @@ def retrieve_documents(
         )
     )
 
+    try:
+        top_k = int(st.session_state.top_k)
+    except (TypeError, ValueError):
+        top_k = 5
+
+    if top_k <= 0:
+        top_k = 5
+
     # --------------------------------------------------------
-    # MULTI-DOCUMENT RETRIEVAL
-    #
-    # No manual selection:
-    #     Search across the authenticated user's documents.
-    #
-    # Manual selection:
-    #     Restrict retrieval to the selected documents.
-    #
-    # PostgreSQL remains the authority for user/document
-    # ownership. VectorDatabase is used for semantic retrieval.
+    # SELECTED DOCUMENTS
     # --------------------------------------------------------
+    # Keep the working selected-document path unchanged: the
+    # MultiDocumentRetriever receives the explicit document IDs.
+    if document_ids:
+        retriever = st.session_state.multi_document_retriever
 
-    retriever = st.session_state.multi_document_retriever
-
-    if retriever is not None:
-        try:
-            is_admin = (
-                str(
-                    user.get(
-                        "role",
-                        "user",
-                    )
-                ).lower()
-                == "admin"
-            )
-
-            if document_ids:
-                selected_sources = []
-
-                for document_id in document_ids:
-                    try:
-                        document = (
-                            st.session_state.db
-                            .get_document_by_id(
-                                document_id,
-                                user_id=user["id"],
-                                is_admin=is_admin,
-                            )
-                        )
-
-                        if document:
-                            filename = document.get("filename")
-
-                            if filename:
-                                selected_sources.append(filename)
-
-                    except Exception:
-                        continue
-
-            else:
-                user_documents = (
-                    st.session_state.db.get_documents(
-                        user_id=user["id"],
-                        is_admin=is_admin,
-                    )
+        if retriever is not None:
+            try:
+                results = retriever.retrieve(
+                    user_id=user["id"],
+                    query=query,
+                    selected_document_ids=document_ids,
+                    chunk_types=active_chunk_types,
+                    top_k=top_k,
                 )
 
-                selected_sources = [
-                    document.get("filename")
-                    for document in user_documents
-                    if document.get("filename")
-                ]
+                if results:
+                    print(
+                        "MULTI-DOCUMENT RETRIEVAL:",
+                        query,
+                        "| SELECTED DOCUMENTS:",
+                        document_ids,
+                        "| RETRIEVED CHUNKS:",
+                        len(results),
+                    )
+                    return results
 
-            results = retriever.retrieve(
+            except Exception as exc:
+                print(
+                    "SELECTED-DOCUMENT RETRIEVAL FAILED:",
+                    exc,
+                )
+
+        # PostgreSQL remains the authoritative fallback for a
+        # selected-document query.
+        try:
+            results = st.session_state.db.search_chunks(
                 user_id=user["id"],
                 query=query,
-                selected_document_ids=(
-                    document_ids
-                    or None
-                ),
-
+                selected_document_ids=document_ids,
                 chunk_types=active_chunk_types,
-                top_k=st.session_state.top_k,
-            )
-
-            print(
-                "MULTI-DOCUMENT RETRIEVAL:",
-                query,
-                "| SELECTED DOCUMENTS:",
-                document_ids,
-                "| RETRIEVED CHUNKS:",
-                len(results),
-                "| CHUNK SOURCES:",
-                [
-                    (
-                        chunk.get("document_id"),
-                        chunk.get("filename"),
-                        chunk.get("source"),
-                    )
-                    for chunk in results
-                ],
+                top_k=top_k,
             )
 
             if results:
@@ -3734,48 +3703,71 @@ def retrieve_documents(
 
         except Exception as exc:
             print(
-                "MULTI-DOCUMENT RETRIEVAL FAILED:",
+                "SELECTED-DOCUMENT POSTGRES RETRIEVAL FAILED:",
                 exc,
             )
 
-    # --------------------------------------------------------
-    # EXISTING POSTGRESQL RETRIEVAL FALLBACK
-    # --------------------------------------------------------
+        return []
 
-    results = (
-        st.session_state.db.search_chunks(
+    # --------------------------------------------------------
+    # NO DOCUMENT SELECTION
+    # --------------------------------------------------------
+    # IMPORTANT: an empty selection means ALL stored documents.
+    # Search the user's persistent document index first. Web search
+    # is handled later by perform_rag() only after explicit approval.
+    try:
+        results = st.session_state.db.search_chunks(
             user_id=user["id"],
             query=query,
-            selected_document_ids=(
-                document_ids
-                or None
-            ),
+            selected_document_ids=None,
             chunk_types=active_chunk_types,
-            top_k=st.session_state.top_k,
+            top_k=top_k,
         )
-    )
 
-    print(
-        "RETRIEVAL QUERY:",
-        query,
-        "| SELECTED DOCUMENTS:",
-        document_ids,
-        "| CHUNK TYPES:",
-        active_chunk_types,
-        "| RETRIEVED CHUNKS:",
-        len(results),
-        "| CHUNK SOURCES:",
-        [
-            (
-                chunk.get("document_id"),
-                chunk.get("filename"),
+        if results:
+            print(
+                "ALL-DOCUMENT POSTGRES RETRIEVAL:",
+                query,
+                "| RETRIEVED CHUNKS:",
+                len(results),
             )
-            for chunk in results
-        ],
-    )
+            return results
 
-    return results
+    except Exception as exc:
+        print(
+            "ALL-DOCUMENT POSTGRES RETRIEVAL FAILED:",
+            exc,
+        )
 
+    # PostgreSQL found nothing, so try the semantic VectorDatabase.
+    retriever = st.session_state.multi_document_retriever
+
+    if retriever is not None:
+        try:
+            results = retriever.retrieve(
+                user_id=user["id"],
+                query=query,
+                selected_document_ids=None,
+                chunk_types=active_chunk_types,
+                top_k=max(top_k, 10),
+            )
+
+            if results:
+                print(
+                    "ALL-DOCUMENT VECTOR RETRIEVAL:",
+                    query,
+                    "| RETRIEVED CHUNKS:",
+                    len(results),
+                )
+                return results[:top_k]
+
+        except Exception as exc:
+            print(
+                "ALL-DOCUMENT VECTOR RETRIEVAL FAILED:",
+                exc,
+            )
+
+    return []
 
 
 def selected_documents_unavailable_message():
