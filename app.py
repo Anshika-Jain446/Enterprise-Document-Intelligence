@@ -3234,6 +3234,9 @@ def initialize_session_state():
         "top_k": DEFAULT_TOP_K,
         "chunking_method": "Recursive",
         "document_search": "",
+        "web_search_permission": False,
+        "web_permission_request": None,
+        "search_source_mode": "Documents → ask before Web",
     }
 
     for key, value in defaults.items():
@@ -3545,6 +3548,8 @@ def logout():
     st.session_state.llm = None
     st.session_state.selected_document_ids = []
     st.session_state.selected_chunk_types = []
+    st.session_state.web_search_permission = False
+    st.session_state.web_permission_request = None
 
     st.rerun()
 
@@ -3846,7 +3851,10 @@ def selected_documents_unavailable_message():
 # RAG
 # ============================================================
 
-def perform_rag(query):
+def perform_rag(
+    query,
+    allow_web=False,
+):
 
     llm = st.session_state.llm
 
@@ -3928,6 +3936,14 @@ def perform_rag(query):
     # A selected document is an explicit instruction to answer
     # from that document, so never plan a web search for it.
     # --------------------------------------------------------
+
+    # --------------------------------------------------------
+    # WEB PERMISSION GUARD
+    # --------------------------------------------------------
+    # The planner must never silently switch from stored
+    # documents to the web.
+    if action == "web_search" and not allow_web:
+        action = "vector_search"
 
     if document_scope and action == "web_search":
 
@@ -4058,6 +4074,22 @@ def perform_rag(query):
     # --------------------------------------------------------
 
     elif action == "web_search":
+
+        # ----------------------------------------------------
+        # NEVER SEARCH THE WEB WITHOUT EXPLICIT PERMISSION.
+        # ----------------------------------------------------
+        if not allow_web:
+            return (
+                (
+                    "I couldn't find sufficient evidence in your "
+                    "stored documents. Would you like me to search "
+                    "the web?"
+                ),
+                local_fallback
+                if "local_fallback" in locals()
+                else [],
+                "web_permission_required",
+            )
 
         try:
 
@@ -4194,7 +4226,21 @@ def perform_rag(query):
 
     # --------------------------------------------------------
     # Web fallback.
+    #
+    # IMPORTANT:
+    # This is no longer automatic. Ask the user first.
     # --------------------------------------------------------
+
+    if not allow_web:
+        return (
+            (
+                "I couldn't find sufficient evidence in your "
+                "stored documents. Would you like me to search "
+                "the web?"
+            ),
+            local_results or [],
+            "web_permission_required",
+        )
 
     try:
 
@@ -4345,6 +4391,42 @@ def render_sidebar():
                     current_method
                 ),
             )
+        )
+
+        st.divider()
+
+        # --------------------------------------------------------
+        # ANSWER SOURCE
+        # --------------------------------------------------------
+        source_options = [
+            "Documents only",
+            "Documents → ask before Web",
+            "Web",
+        ]
+
+        current_source_mode = st.session_state.get(
+            "search_source_mode",
+            "Documents → ask before Web",
+        )
+
+        if current_source_mode not in source_options:
+            current_source_mode = (
+                "Documents → ask before Web"
+            )
+
+        st.session_state.search_source_mode = st.radio(
+            "Answer source",
+            source_options,
+            index=source_options.index(
+                current_source_mode
+            ),
+            help=(
+                "Documents only: never search the web. "
+                "Documents → ask before Web: search stored "
+                "documents first and ask before web. "
+                "Web: web search still requires explicit "
+                "confirmation."
+            ),
         )
 
         st.divider()
@@ -4587,6 +4669,144 @@ def chat_page():
             )
 
     # --------------------------------------------------------
+    # Pending web permission.
+    pending_web = st.session_state.get(
+        "web_permission_request"
+    )
+
+    if pending_web:
+        st.warning(
+            "No sufficient evidence was found in your "
+            "stored documents."
+        )
+
+        st.markdown(
+            "**Would you like me to search the web for this question?**"
+        )
+
+        web_yes, web_no = st.columns(2)
+
+        with web_yes:
+            if st.button(
+                "🌐 Yes, Search the Web",
+                key="approve_pending_web_search",
+                use_container_width=True,
+            ):
+                approved_query = str(
+                    pending_web.get(
+                        "query",
+                        "",
+                    )
+                ).strip()
+
+                st.session_state.web_permission_request = None
+                st.session_state.web_search_permission = True
+
+                with st.spinner(
+                    "Searching the web because you allowed it..."
+                ):
+                    try:
+                        (
+                            web_answer,
+                            web_sources,
+                            web_source_type,
+                        ) = perform_rag(
+                            approved_query,
+                            allow_web=True,
+                        )
+
+                        st.session_state.web_search_permission = False
+
+                        st.markdown(web_answer)
+
+                        if web_sources:
+                            with st.expander(
+                                "🔎 Web evidence"
+                            ):
+                                st.caption(
+                                    "Source type: web"
+                                )
+
+                                for index, source in enumerate(
+                                    web_sources,
+                                    start=1,
+                                ):
+                                    if not isinstance(
+                                        source,
+                                        dict,
+                                    ):
+                                        continue
+
+                                    filename = (
+                                        source.get("title")
+                                        or source.get("source")
+                                        or source.get("url")
+                                        or "Web result"
+                                    )
+
+                                    st.markdown(
+                                        f"**{index}. {filename}**"
+                                    )
+
+                                    url = source.get(
+                                        "url"
+                                    )
+
+                                    if url:
+                                        st.caption(
+                                            f"URL: {url}"
+                                        )
+
+                                    content = (
+                                        source.get("content")
+                                        or source.get("text")
+                                        or source.get("snippet")
+                                        or ""
+                                    )
+
+                                    if content:
+                                        st.text_area(
+                                            "Web evidence",
+                                            str(content),
+                                            height=160,
+                                            key=(
+                                                f"approved_web_evidence_"
+                                                f"{index}_"
+                                                f"{abs(hash(str(content)))}"
+                                            ),
+                                            label_visibility="collapsed",
+                                        )
+
+                        try:
+                            st.session_state.db.save_message(
+                                conversation_id,
+                                "assistant",
+                                web_answer,
+                                user_id=user_id,
+                            )
+                        except Exception:
+                            pass
+
+                    except Exception as exc:
+                        st.session_state.web_search_permission = False
+                        st.error(
+                            f"Web search failed: {exc}"
+                        )
+
+        with web_no:
+            if st.button(
+                "📄 No, Stay With Documents",
+                key="deny_pending_web_search",
+                use_container_width=True,
+            ):
+                st.session_state.web_permission_request = None
+                st.session_state.web_search_permission = False
+
+                st.info(
+                    "Okay. I will not search the web. "
+                    "Your documents remain the only source."
+                )
+
     # Prompt
     # --------------------------------------------------------
 
@@ -4649,7 +4869,15 @@ def chat_page():
                     answer,
                     sources,
                     source_type,
-                ) = perform_rag(prompt)
+                ) = perform_rag(
+                    prompt,
+                    allow_web=False,
+                )
+
+                if source_type == "web_permission_required":
+                    st.session_state.web_permission_request = {
+                        "query": prompt,
+                    }
 
                 st.markdown(answer)
 
@@ -4657,7 +4885,10 @@ def chat_page():
                 # Evidence
                 # --------------------------------------------
 
-                if sources:
+                if (
+                    sources
+                    and source_type != "web_permission_required"
+                ):
 
                     with st.expander(
                         "🔎 Retrieved evidence"
