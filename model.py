@@ -259,6 +259,7 @@ class GeminiModel:
         query,
         previous_actions=None,
         previous_evaluations=None,
+        source_mode="documents",
     ):
 
         if not query or not query.strip():
@@ -273,6 +274,17 @@ class GeminiModel:
         previous_evaluations = (
             previous_evaluations or []
         )
+
+        source_mode = str(
+            source_mode or "documents"
+        ).strip().lower()
+
+        if source_mode not in {
+            "documents",
+            "web",
+            "documents_and_web",
+        }:
+            source_mode = "documents"
 
         system_prompt = """
 You are the planning component of an enterprise
@@ -316,6 +328,15 @@ Return exactly:
 """
 
         user_prompt = f"""
+CURRENT SOURCE MODE:
+
+{source_mode}
+
+SOURCE POLICY:
+- documents = stored/indexed documents only.
+- web = web only.
+- documents_and_web = documents first; web allowed after document retrieval.
+
 CURRENT USER QUESTION:
 
 {query}
@@ -338,9 +359,9 @@ Choose the next retrieval action.
 """
 
         fallback_action = (
-            "vector_search"
-            if not previous_actions
-            else "web_search"
+            "web_search"
+            if source_mode == "web"
+            else "vector_search"
         )
 
         fallback = {
@@ -366,6 +387,11 @@ Choose the next retrieval action.
 
         if action not in allowed_actions:
             action = fallback_action
+
+        if source_mode == "documents" and action == "web_search":
+            action = "vector_search"
+        elif source_mode == "web":
+            action = "web_search"
 
         search_query = result.get("query")
 
@@ -395,7 +421,19 @@ Choose the next retrieval action.
         query,
         results,
         action,
+        source_mode="documents",
     ):
+
+        source_mode = str(
+            source_mode or "documents"
+        ).strip().lower()
+
+        if source_mode not in {
+            "documents",
+            "web",
+            "documents_and_web",
+        }:
+            source_mode = "documents"
 
         if not results:
 
@@ -405,7 +443,13 @@ Choose the next retrieval action.
                 "reason": "No evidence was retrieved.",
                 "recommended_action": (
                     "web_search"
-                    if action != "web_search"
+                    if (
+                        source_mode == "web"
+                        or (
+                            source_mode == "documents_and_web"
+                            and action != "web_search"
+                        )
+                    )
                     else "vector_search"
                 ),
             }
@@ -491,7 +535,13 @@ Evaluate the evidence.
 
         fallback_action = (
             "web_search"
-            if action != "web_search"
+            if (
+                source_mode == "web"
+                or (
+                    source_mode == "documents_and_web"
+                    and action != "web_search"
+                )
+            )
             else "vector_search"
         )
 
@@ -544,6 +594,14 @@ Evaluate the evidence.
 
         if recommended_action not in allowed_actions:
             recommended_action = fallback_action
+
+        if (
+            source_mode == "documents"
+            and recommended_action == "web_search"
+        ):
+            recommended_action = "vector_search"
+        elif source_mode == "web":
+            recommended_action = "web_search"
 
         return {
             "sufficient": sufficient,
