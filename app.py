@@ -3996,16 +3996,137 @@ def _retrieve_all_table_chunks(document_ids=None, user_id=None):
 
 
 def _table_question(query):
+    """Detect table-related requests without requiring exact wording."""
     text = str(query or "").lower()
-    return "table" in text and any(
-        x in text
-        for x in (
-            "how many", "number of", "total", "count",
-            "which table", "list", "all tables", "tables are there",
+    return "table" in text or "tables" in text
+
+
+def _table_count_question(query):
+    """Detect requests whose intent is to count tables."""
+    text = str(query or "").lower()
+    if not _table_question(text):
+        return False
+    return any(x in text for x in (
+        "how many", "how much", "number of", "total", "count",
+        "quantity", "amount", "no. of", "no of",
+    ))
+
+
+def _extract_table_reference(query):
+    """Extract a table number from natural-language wording."""
+    import re
+    text = str(query or "")
+    for pattern in (
+        r"\btable\s*(?:no\.?\s*)?([ivxlcdm]+|\d+)\b",
+        r"\btab(?:le)?\s*([ivxlcdm]+|\d+)\b",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return str(match.group(1)).upper()
+    return None
+
+
+def _retrieve_specific_table_evidence(document_ids=None, user_id=None, table_number=None):
+    """Retrieve actual indexed evidence for one requested table.
+
+    PDF tables can be stored inside ordinary Document chunks and can be split
+    across several chunks. This retrieves the caption-containing chunk plus
+    the other chunks on that page and the immediately following page, rather
+    than returning only a synthetic caption/count record.
+    """
+    import re
+    db = st.session_state.db
+    uid = int(user_id if user_id is not None else st.session_state.user["id"])
+    ids = []
+    for value in document_ids or []:
+        try:
+            ids.append(int(value))
+        except Exception:
+            pass
+
+    conn = db.connect()
+    cursor = None
+    try:
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        conditions = ["d.user_id = %s", "COALESCE(c.content, '') <> ''"]
+        params = [uid]
+        if ids:
+            conditions.append("d.id = ANY(%s)")
+            params.append(ids)
+
+        cursor.execute(
+            f"""
+            SELECT c.id, c.document_id, c.chunk_id, c.chunk_type,
+                   c.content, c.page, c.tokens, c.characters, c.metadata,
+                   c.chunk_data, c.created_at, d.filename, d.file_type,
+                   d.chunking_method
+            FROM public.document_chunks c
+            INNER JOIN public.documents d ON d.id = c.document_id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY d.filename, c.page NULLS LAST, c.chunk_id, c.id
+            """,
+            params,
         )
-    )
+        rows = [dict(row) for row in cursor.fetchall()]
+        target = str(table_number or "").upper()
+        caption_re = re.compile(
+            r"\btable\s*(?:no\.?\s*)?([ivxlcdm]+|\d+)\b",
+            re.IGNORECASE,
+        )
 
+        anchors = []
+        for row in rows:
+            content = str(row.get("content") or "")
+            if any(str(m).upper() == target for m in caption_re.findall(content)):
+                anchors.append(row)
+        if not anchors:
+            conn.rollback()
+            return []
 
+        pages_by_doc = {}
+        for row in anchors:
+            doc_id = row.get("document_id")
+            pages_by_doc.setdefault(doc_id, set())
+            try:
+                page_num = int(str(row.get("page")).strip())
+                pages_by_doc[doc_id].update({page_num, page_num + 1})
+            except Exception:
+                pages_by_doc[doc_id].add(None)
+
+        selected = []
+        for row in rows:
+            doc_id = row.get("document_id")
+            if doc_id not in pages_by_doc:
+                continue
+            try:
+                page_num = int(str(row.get("page")).strip())
+            except Exception:
+                page_num = None
+            if page_num in pages_by_doc[doc_id]:
+                selected.append(row)
+
+        if not selected:
+            selected = anchors
+
+        result = []
+        seen = set()
+        for row in selected:
+            key = (row.get("document_id"), row.get("id"), row.get("chunk_id"), row.get("page"))
+            if key in seen:
+                continue
+            seen.add(key)
+            item = dict(row)
+            item["retrieval_type"] = "specific_table_evidence"
+            result.append(item)
+
+        conn.rollback()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
 
 
 def retrieve_documents(
@@ -4055,11 +4176,44 @@ def retrieve_documents(
     retrieval_top_k = max(top_k, 25) if _is_broad_document_question(query) else top_k
 
     # --------------------------------------------------------
+    # --------------------------------------------------------
+    # SPECIFIC TABLE CONTENT QUESTIONS
+    # --------------------------------------------------------
+    # If the user asks about a particular table, retrieve its actual content
+    # rather than the synthetic table-count summary.
+    if _table_question(query) and not _table_count_question(query):
+        table_number = _extract_table_reference(query)
+        if table_number:
+            try:
+                table_scope_ids = document_ids or None
+                if not table_scope_ids:
+                    is_admin = str(user.get("role", "user")).lower() == "admin"
+                    docs = st.session_state.db.get_documents(
+                        user_id=user["id"], is_admin=is_admin
+                    ) or []
+                    named_docs = _document_ids_matching_query(query, docs)
+                    if named_docs:
+                        table_scope_ids = [d.get("id") for d in named_docs]
+                specific_results = _retrieve_specific_table_evidence(
+                    document_ids=table_scope_ids,
+                    user_id=user["id"],
+                    table_number=table_number,
+                )
+                if specific_results:
+                    print(
+                        "SPECIFIC TABLE RETRIEVAL:", original_query,
+                        "| TABLE:", table_number,
+                        "| CHUNKS:", len(specific_results),
+                    )
+                    return specific_results
+            except Exception as exc:
+                print("SPECIFIC TABLE RETRIEVAL FAILED:", exc)
+
     # STRUCTURAL TABLE QUESTIONS
     # --------------------------------------------------------
     # Do not try to answer a total-table question from top-k semantic
     # chunks. Retrieve every indexed table chunk for the allowed scope.
-    if (intent == "table_search") or _table_question(query):
+    if _table_count_question(query):
         try:
             table_scope_ids = document_ids or None
 
